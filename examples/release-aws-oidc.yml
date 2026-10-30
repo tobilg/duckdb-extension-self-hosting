@@ -1,0 +1,80 @@
+# The workflow from release.yml for a bucket on AWS, with an IAM role instead of storage keys.
+# See "Publishing to AWS with OIDC" in the README for the role it needs.
+name: Release extension
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
+    with:
+      duckdb_version: v2.0.0
+      ci_tools_version: v2.0-cyanoptera
+      extension_name: my_ext
+
+  # Has the signing key, and never runs your extension's code. Environment secrets with required reviewers keep the key away
+  # from everything else in the repository.
+  sign:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release-signing
+    outputs:
+      bundle-digest: ${{ steps.sign.outputs.bundle-digest }}
+    steps:
+      # Replace <commit-sha> with the commit of a release: this step handles your signing key.
+      - id: sign
+        uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+        with:
+          mode: sign
+          extension-name: my_ext
+          signing-key: ${{ secrets.EXTENSION_SIGNING_KEY }}
+          # Listed in the key file, so that clients can pin it too. See "Rotating keys" in the README.
+          additional-public-keys: ${{ vars.EXTENSION_RESERVE_PUBLIC_KEY }}
+
+  # Runs your extension's code, so it has no secrets at all, and can't request a token for your role.
+  # Each runner tests its own platform, so add every type you can.
+  verify:
+    needs: sign
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions: {}
+    steps:
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+        with:
+          mode: verify
+
+  # The only job that can assume the role. The role's trust policy names this job's environment, and it only runs after every
+  # verify job has passed.
+  publish:
+    needs: [sign, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release-storage
+    permissions:
+      contents: read
+      id-token: write
+    # Releases go out one at a time: uploads of two runs could otherwise mix on the latest paths.
+    concurrency:
+      group: publish-my_ext
+      cancel-in-progress: false
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::<account_id>:role/extension-publisher
+          aws-region: <bucket-region>
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+        with:
+          mode: publish
+          bundle-digest: ${{ needs.sign.outputs.bundle-digest }}
+          s3-bucket: my-extensions
+          repository-url: https://extensions.example.com

@@ -58,6 +58,9 @@ check_credentials() {
 	fi
 	# Only your own machines can have an instance role.
 	if [ "${RUNNER_ENVIRONMENT:-}" = "self-hosted" ]; then return 0; fi
+	if [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+		die "No S3 credentials found. This job has 'id-token: write', but nothing has assumed a role yet. Run aws-actions/configure-aws-credentials before this step."
+	fi
 	die "No S3 credentials found. Set 's3-access-key-id' and 's3-secret-access-key', or assume a role in an earlier step. $KEY_HINT"
 }
 
@@ -88,9 +91,15 @@ verify)
 	if is_true "${HAS_S3_ACCESS_KEY_ID:-false}" || is_true "${HAS_S3_SECRET_ACCESS_KEY:-false}" || is_true "${HAS_S3_SESSION_TOKEN:-false}"; then
 		die "Don't pass S3 credentials to mode 'verify'. It runs the extension's native code, which could read them, and it doesn't need the bucket."
 	fi
-	if [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] || [ -n "${AWS_SESSION_TOKEN:-}" ]; then
-		die "This job has AWS credentials in its environment, and mode 'verify' runs the extension's native code, which could read them. Remove them from this job."
+	# GitHub sets these when a job has the permission, and any code in the job can then request a token and assume a role.
+	if [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] || [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+		die "This job has 'id-token: write', and mode 'verify' runs the extension's native code, which could use it to assume your publishing role. Set 'permissions: {}' on this job, and grant 'id-token: write' only on the publish job."
 	fi
+	for variable in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_PROFILE AWS_SHARED_CREDENTIALS_FILE; do
+		if [ -n "${!variable:-}" ]; then
+			die "This job has $variable in its environment, and mode 'verify' runs the extension's native code, which could use it to reach your AWS account. Remove it from this job."
+		fi
+	done
 	require_tool openssl
 	require_tool curl
 	require_tool tar

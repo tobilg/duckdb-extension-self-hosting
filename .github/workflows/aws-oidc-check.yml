@@ -1,0 +1,80 @@
+# Runs the OIDC route against real AWS, which the rest of CI can't: the trust policy, the role's permissions, the bucket's
+# region, and a first publish looking for a key file that isn't there yet. The README's Development section lists what it needs.
+name: AWS OIDC check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      bundle-digest: ${{ steps.sign.outputs.bundle-digest }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Create a key for this run and fetch a real extension
+        run: |
+          openssl genrsa -out "$RUNNER_TEMP/test.pem" 2048
+          {
+            echo 'TEST_SIGNING_KEY<<EOF'
+            cat "$RUNNER_TEMP/test.pem"
+            echo 'EOF'
+          } >>"$GITHUB_ENV"
+          source tests/lib.sh
+          fetch_fixture community v2.0.0/linux_amd64/rusty_quack.duckdb_extension "$RUNNER_TEMP/binaries/rusty_quack.duckdb_extension"
+      - id: sign
+        uses: ./
+        with:
+          mode: sign
+          extension-name: rusty_quack
+          path: ${{ runner.temp }}/binaries
+          signing-key: ${{ env.TEST_SIGNING_KEY }}
+          signed-artifact: aws-oidc-check
+
+  publish:
+    needs: sign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: aws-oidc-check
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_CHECK_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_CHECK_REGION }}
+
+      - name: Publish
+        id: publish
+        uses: ./
+        with:
+          mode: publish
+          signed-artifact: aws-oidc-check
+          bundle-digest: ${{ needs.sign.outputs.bundle-digest }}
+          s3-bucket: ${{ vars.AWS_CHECK_BUCKET }}
+          s3-prefix: ci/${{ github.run_id }}
+
+      - name: Check the outputs
+        env:
+          UPLOADED: ${{ steps.publish.outputs.uploaded-objects }}
+          REPOSITORY_URL: ${{ steps.publish.outputs.repository-url }}
+          EXPECTED_URL: s3://${{ vars.AWS_CHECK_BUCKET }}/ci/${{ github.run_id }}
+        run: |
+          set -x
+          test "$(jq 'length' <<<"$UPLOADED")" = 3
+          test "$REPOSITORY_URL" = "$EXPECTED_URL"
+
+      - name: Publish again, which must change nothing
+        uses: ./
+        with:
+          mode: publish
+          signed-artifact: aws-oidc-check
+          bundle-digest: ${{ needs.sign.outputs.bundle-digest }}
+          s3-bucket: ${{ vars.AWS_CHECK_BUCKET }}
+          s3-prefix: ci/${{ github.run_id }}
