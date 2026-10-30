@@ -295,13 +295,40 @@ publish private_explicit private-bucket "$KEY_ONE" INPUT_S3_PREFIX=explicit INPU
 ok_or_log 'an explicit s3:// repository-url works too' $?
 check_contains 'and is what gets checked' "$RUN_LOG" 'Checking what s3://private-bucket/explicit serves'
 
-echo; echo '--- credentials from the environment, as with OIDC'
+echo; echo '--- credentials from the environment'
 sign env_sign "$RUNS_DIR/native" "$KEY_ONE"
 ENV_BUNDLE=$(bundle_dir)
-run_action env INPUT_MODE=publish TEST_BUNDLE="$ENV_BUNDLE" INPUT_BUNDLE_DIGEST="$(output_value bundle-digest)" INPUT_S3_BUCKET=env-bucket INPUT_S3_ENDPOINT="$S3_ENDPOINT" \
+ENV_DIGEST=$(output_value bundle-digest)
+run_action env INPUT_MODE=publish TEST_BUNDLE="$ENV_BUNDLE" INPUT_BUNDLE_DIGEST="$ENV_DIGEST" INPUT_S3_BUCKET=env-bucket INPUT_S3_ENDPOINT="$S3_ENDPOINT" \
 	AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$S3_SECRET_ACCESS_KEY" RCLONE_CA_CERT="$CA"
 ok_or_log 'publishes with AWS_* variables only' $?
 check_contains 'the check ran' "$RUN_LOG" 'serves what was uploaded'
+
+echo; echo '--- a role from GitHub OIDC'
+# What configure-aws-credentials exports, in a job with the permission, and no credential inputs. Without s3-endpoint the
+# provider is AWS, as on real AWS, and only the SDK's own override reaches the local store. The store accepts any session
+# token, so this proves what the action sends, and not what IAM would make of it.
+publish_with_role() { # <run name> [VAR=value...]
+	local name=$1
+	shift
+	run_action "$name" INPUT_MODE=publish TEST_BUNDLE="$ENV_BUNDLE" INPUT_BUNDLE_DIGEST="$ENV_DIGEST" INPUT_S3_BUCKET=env-bucket INPUT_S3_PREFIX="$name" \
+		AWS_ENDPOINT_URL_S3="$S3_ENDPOINT" AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$S3_SECRET_ACCESS_KEY" AWS_SESSION_TOKEN=session-from-oidc \
+		AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ACTIONS_ID_TOKEN_REQUEST_TOKEN=x ACTIONS_ID_TOKEN_REQUEST_URL=https://x.invalid RCLONE_CA_CERT="$CA" "$@"
+}
+publish_with_role oidc
+ok_or_log 'publishes with only what the role leaves in the environment' $?
+check_contains 'on the AWS provider' "$RUN_LOG" 'provider AWS'
+check_contains 'and the check ran' "$RUN_LOG" 'serves what was uploaded'
+check_not_contains 'the session token stays out of the log' "$RUN_LOG" 'session-from-oidc'
+check_equal 'every object was uploaded' 3 "$(output_block uploaded-objects | jq 'length')"
+publish_with_role oidc_dump RCLONE_DUMP=headers,auth RCLONE_LOG_LEVEL=DEBUG
+ok_or_log 'publishes with rclone showing its requests' $?
+check 'and sends the session token' grep -qi 'X-Amz-Security-Token: session-from-oidc' "$RUN_LOG"
+check 'and signs for the region of the role' grep -q '/us-east-1/s3/aws4_request' "$RUN_LOG"
+publish_with_role oidc_inputs INPUT_S3_ACCESS_KEY_ID="$S3_ACCESS_KEY_ID" INPUT_S3_SECRET_ACCESS_KEY="$S3_SECRET_ACCESS_KEY" \
+	AWS_ACCESS_KEY_ID=stale AWS_SECRET_ACCESS_KEY=stale RCLONE_DUMP=headers,auth RCLONE_LOG_LEVEL=DEBUG
+ok_or_log 'input keys win over a role left in the job' $?
+check_not 'and do not send its session token' grep -qi 'X-Amz-Security-Token: session-from-oidc' "$RUN_LOG"
 
 echo; echo '--- stable C API build'
 STABLE_PREFIX=stable

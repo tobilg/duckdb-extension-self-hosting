@@ -37,7 +37,7 @@ Create a second key the same way and keep it offline. Pinning both from the star
 | `S3_ENDPOINT` | Your store's S3 API, such as `https://<account_id>.r2.cloudflarestorage.com`. Leave out the input on AWS. |
 | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | A token that can read, write and list the bucket's objects. On AWS, that's `s3:GetObject`, `s3:PutObject` and `s3:ListBucket`. |
 
-Prefer [environment secrets](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments) with required reviewers, one environment for the key and another for the storage credentials, so that each is only available to the job that needs it. On AWS, you can skip the static keys: role assumption through OIDC sets the `AWS_*` variables, and the action picks those up.
+Prefer [environment secrets](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments) with required reviewers, one environment for the key and another for the storage credentials, so that each is only available to the job that needs it. On AWS, you can [use OIDC](#publishing-to-aws-with-oidc) instead of the two S3 secrets and `S3_ENDPOINT`.
 
 ### 3. Add the workflow
 
@@ -166,7 +166,7 @@ For `mode: publish`:
 | `s3-endpoint` | AWS | S3 API endpoint. Use `https://`: plain `http://` gets a warning, and rclone's AWS provider refuses to upload over it. |
 | `s3-region` | `auto` on R2, `AWS_REGION` elsewhere | Bucket region |
 | `s3-provider` | detected | [rclone provider](https://rclone.org/s3/) |
-| `s3-access-key-id`, `s3-secret-access-key`, `s3-session-token` | `AWS_*` variables | Credentials. Set the key ID and secret together. Setting them ignores any `AWS_SESSION_TOKEN` in the environment. |
+| `s3-access-key-id`, `s3-secret-access-key`, `s3-session-token` | `AWS_*` variables | Credentials. Set the key ID and secret together. Setting them ignores any `AWS_SESSION_TOKEN` in the environment. Leave them out to use a [role through OIDC](#publishing-to-aws-with-oidc). |
 | `overwrite-versioned` | `false` | Allow replacing a versioned object with different bytes |
 | `allow-key-change` | `false` | Allow a signing key that isn't in the bucket's key file, for a [rotation](#rotating-keys) |
 | `allow-downgrade` | `false` | Allow moving the latest path to a lower version |
@@ -216,6 +216,96 @@ If the upload itself fails partway, the summary and `uploaded-objects` list what
 
 Two publish jobs at the same time can still get past the version check, because it isn't atomic on S3. That's why the workflow above has a `concurrency` group: use one for every extension.
 
+## Publishing to AWS with OIDC
+
+On AWS, the publish job can assume an IAM role through GitHub's OIDC provider, so that no storage keys are kept in GitHub. This is optional: the keys from the [Quick start](#2-add-the-secrets) keep working, and the other two jobs don't change. It only works on AWS, because Cloudflare R2 doesn't accept AWS roles.
+
+> **Status:** tested with the credentials this produces against a local store, but not yet against real AWS.
+
+First, create an [IAM identity provider](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc.html) in your account, with the URL `https://token.actions.githubusercontent.com` and the audience `sts.amazonaws.com`.
+
+Then create a role that trusts it. The subject limits the role to the publish job, because a job only gets `environment:release-storage` in its token if it runs in that environment:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::<account_id>:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": "<subject>"
+        }
+      }
+    }
+  ]
+}
+```
+
+The subject depends on [the repository that runs the workflow](https://github.blog/changelog/2026-04-23-immutable-subject-claims-for-github-actions-oidc-tokens/):
+
+| Repository | Subject |
+| --- | --- |
+| Created on or after 15 July 2026, opted in, or renamed or transferred since | `repo:<owner>@<owner_id>/<repo>@<repo_id>:environment:release-storage` |
+| Any other | `repo:<owner>/<repo>:environment:release-storage` |
+
+The wrong form fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity`. To see what your job really gets, follow AWS's [token inspection steps](https://github.com/aws-actions/configure-aws-credentials/blob/v6.3.0/README.md#inspecting-the-token).
+
+Give the role access to the bucket:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
+      "Resource": "arn:aws:s3:::my-extensions/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-extensions"
+    }
+  ]
+}
+```
+
+In the workflow, only the publish job changes. It assumes the role first, and leaves out the S3 keys and the endpoint. [`examples/release-aws-oidc.yml`](examples/release-aws-oidc.yml) has the complete workflow.
+
+```yaml
+publish:
+  needs: [sign, verify]
+  runs-on: ubuntu-24.04
+  timeout-minutes: 30
+  environment: release-storage
+  permissions:
+    contents: read
+    id-token: write
+  concurrency:
+    group: publish-my_ext
+    cancel-in-progress: false
+  steps:
+    - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      with:
+        role-to-assume: arn:aws:iam::<account_id>:role/extension-publisher
+        aws-region: <bucket-region>
+    - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+      with:
+        mode: publish
+        bundle-digest: ${{ needs.sign.outputs.bundle-digest }}
+        s3-bucket: my-extensions
+        repository-url: https://extensions.example.com
+```
+
+- **Only this job gets `id-token: write`.** Don't set it for the whole workflow: `verify` refuses to run with it, because your extension's code could use it to assume the role.
+- **Credentials last 1 hour by default, and don't refresh.** A publish that takes longer fails partway, and the summary lists what went live. Set `role-duration-seconds` on AWS's action to extend it.
+
 ## Serving the bucket
 
 Clients only send `HEAD` and `GET`, so a public bucket can be served from any HTTPS endpoint. Clients reject anything not signed by a key they pinned, so the bucket doesn't have to be trusted.
@@ -234,7 +324,7 @@ Custom domains go through Cloudflare's cache, which [keeps `.gz` files for 2 hou
 
 - **Pin the action by commit.** It handles your signing key: `uses: tobilg/duckdb-extension-self-hosting@<sha> # v1.0.0`.
 - **Limit who can reach the key.** Use an environment with required reviewers, and only run the job on tags.
-- **Why three jobs.** The runner keeps a job's secrets in its own memory for the whole job, and code running in that job can read them there, as the [tj-actions compromise](https://www.cve.org/CVERecord?id=CVE-2025-30066) did. A clean environment for the DuckDB CLI doesn't change that, so a build that's compromised upstream could steal a signing key from any job that loads it, and a key can't be revoked. So `verify` refuses to run in a job that signed or published, and refuses the key, S3 credentials and `AWS_*` credentials in its job. It can't see other secrets you add to that job, so don't.
+- **Why three jobs.** The runner keeps a job's secrets in its own memory for the whole job, and code running in that job can read them there, as the [tj-actions compromise](https://www.cve.org/CVERecord?id=CVE-2025-30066) did. A clean environment for the DuckDB CLI doesn't change that, so a build that's compromised upstream could steal a signing key from any job that loads it, and a key can't be revoked. So `verify` refuses to run in a job that signed or published, and refuses the key, S3 credentials, `AWS_*` credentials and `id-token: write` in its job. It can't see other secrets you add to that job, so don't. With [OIDC](#publishing-to-aws-with-oidc), limiting the role's subject to the publish job's environment is a second layer: a token from another job doesn't match it.
 - **What the action does with the key.** It goes through the signing step's environment into a `0600` file, after the artifacts are downloaded. The file is deleted as soon as the last binary is signed, before compressing, and a final step removes it if the run was killed before that. It's never passed to rclone, and tracing is never turned on.
 - **What the verify job can reach.** It runs your extension's native code with only `PATH`, `HOME`, `TMPDIR`, and the proxy and CA variables in the CLI's environment. Set `permissions: {}` on it, because it needs no `GITHUB_TOKEN`. It can reach the workflow run's artifacts, but anything it changes fails the `bundle-digest` check, and it can't sign anything.
 - **What it downloads.** rclone is pinned and checked against hashes stored in this repository. The verify job gets the DuckDB CLI for each published version from DuckDB's GitHub releases, over HTTPS only and without a hash check, because the version comes from your build. No `curl | bash`.
@@ -302,6 +392,8 @@ bash tests/rclone-pin.sh  # checks the rclone pin, or moves it: bash tests/rclon
 ```
 
 Scripts must keep running on bash 3.2, the stock bash on macOS. The behavior this action relies on is in [DuckDB](https://github.com/duckdb/duckdb)'s `extension_repository_manager.cpp` and `extension_install_dynamic.cpp`, [`duckdb-web`](https://github.com/duckdb/duckdb-web)'s `extension_repositories.md`, and [`duckdb-wasm`](https://github.com/duckdb/duckdb-wasm).
+
+`.github/workflows/aws-oidc-check.yml` runs the OIDC route against real AWS. It only runs by hand, and needs a test bucket, a [role](#publishing-to-aws-with-oidc) whose subject names the environment `aws-oidc-check`, and the variables `AWS_CHECK_ROLE_ARN`, `AWS_CHECK_REGION` and `AWS_CHECK_BUCKET`. It writes to `ci/<run_id>`, and the role can't delete, so expire that prefix with a lifecycle rule.
 
 The tests download real extensions and check them against `tests/fixtures.sha256`. A hash mismatch means that the file changed on DuckDB's servers, not that this project broke. Dependabot keeps the pinned actions and the Wasm test's packages up to date.
 

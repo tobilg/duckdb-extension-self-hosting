@@ -18,6 +18,8 @@ jobs:
         run: shellcheck -x scripts/*.sh tests/*.sh tests/wasm/run.sh
       - name: actionlint
         run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+      - name: actionlint on the examples
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color examples/*.yml
 
   pins:
     name: Vendored hash script and pinned rclone match upstream
@@ -247,6 +249,56 @@ jobs:
           set -x
           test "$OUTCOME" = failure
           test "$(curl -s -o /dev/null -w '%{http_code}' "$S3_ENDPOINT/public-bucket/wrong-digest/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz")" = 404
+
+      # This stays the last step, because these variables stay for the rest of the job. configure-aws-credentials exports the
+      # same ones the same way. Without s3-endpoint the provider is AWS, and only the SDK's own override reaches the local store.
+      - name: Export credentials the way a role from OIDC does
+        run: |
+          {
+            echo "AWS_ENDPOINT_URL_S3=$S3_ENDPOINT"
+            echo "AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID"
+            echo "AWS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY"
+            echo 'AWS_SESSION_TOKEN=session-from-oidc'
+            echo 'AWS_REGION=us-east-1'
+            echo 'AWS_DEFAULT_REGION=us-east-1'
+          } >>"$GITHUB_ENV"
+      - name: Publish with credentials from the job's environment
+        id: publish-role
+        uses: ./
+        with:
+          mode: publish
+          signed-artifact: ci-signed
+          bundle-digest: ${{ needs.action-sign.outputs.bundle-digest }}
+          s3-bucket: public-bucket
+          s3-prefix: role
+      - name: Check that it published everything
+        env:
+          UPLOADED: ${{ steps.publish-role.outputs.uploaded-objects }}
+        run: |
+          set -x
+          test "$(jq 'length' <<<"$UPLOADED")" = 5
+
+  action-oidc-guard:
+    name: Refuse to run native code in a job that can request an OIDC token
+    # Pull requests from forks don't get this permission, so there would be nothing to refuse.
+    if: github.event.pull_request.head.repo.fork != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Runs the check directly, because the outcome of a step using the action can't show why it failed.
+      - name: Check that mode verify refuses this job, for this reason
+        run: |
+          if INPUT_MODE=verify bash scripts/setup.sh >output 2>&1; then
+            cat output
+            echo 'The guard let a job with this permission run.'
+            exit 1
+          fi
+          sed 's/^::error:://' output
+          grep -F "'id-token: write'" output
 
   action-one-job:
     name: Refuse to run native code in a job with secrets

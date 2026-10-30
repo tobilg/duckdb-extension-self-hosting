@@ -391,6 +391,8 @@ check_refused 'publish does not take the signing key' "Don't pass 'signing-key'"
 check_refused 'a repository-url with a line break fails' 'contains whitespace' publish_setup newline_url INPUT_REPOSITORY_URL="$(printf 'https://x\nfingerprint=forged')" INPUT_S3_ACCESS_KEY_ID=a INPUT_S3_SECRET_ACCESS_KEY=b
 check_refused 'no credentials fail before anything else happens' 'No S3 credentials' publish_setup nocreds
 check_not_contains 'and before rclone is downloaded' "$RUN_LOG" 'Installed rclone'
+check_not_contains 'and do not bring up OIDC in a job that does not use it' "$RUN_LOG" 'configure-aws-credentials'
+check_refused 'a job that can request an OIDC token but assumed no role is told what to add' 'configure-aws-credentials' publish_setup oidc_no_role ACTIONS_ID_TOKEN_REQUEST_TOKEN=x ACTIONS_ID_TOKEN_REQUEST_URL=https://x.invalid
 check_refused 'a key without a secret fails' 'Set both' publish_setup creds_id INPUT_S3_ACCESS_KEY_ID=a AWS_SECRET_ACCESS_KEY=fromenv
 check_refused 'a secret without a key fails' 'Set both' publish_setup creds_secret INPUT_S3_SECRET_ACCESS_KEY=b AWS_ACCESS_KEY_ID=fromenv
 check_refused 'a session token without a key fails' "'s3-session-token' only works" publish_setup creds_token INPUT_S3_SESSION_TOKEN=c AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y
@@ -399,12 +401,22 @@ check 'credentials from the environment are enough' publish_step AWS_ACCESS_KEY_
 check 'so is a role to assume' publish_step AWS_WEB_IDENTITY_TOKEN_FILE=/x
 check 'and a self-hosted runner can have an instance role' publish_step RUNNER_ENVIRONMENT=self-hosted
 check_not 'which a GitHub-hosted runner can not' publish_step RUNNER_ENVIRONMENT=github-hosted
+check 'publish accepts a job with a role from OIDC' publish_step ACTIONS_ID_TOKEN_REQUEST_TOKEN=x ACTIONS_ID_TOKEN_REQUEST_URL=https://x.invalid AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y AWS_SESSION_TOKEN=z AWS_REGION=us-east-1
+check 'and static keys in a job that also has the permission' publish_step ACTIONS_ID_TOKEN_REQUEST_TOKEN=x HAS_S3_ACCESS_KEY_ID=true HAS_S3_SECRET_ACCESS_KEY=true
+check 'and an instance role on a self-hosted runner that also has it' publish_step ACTIONS_ID_TOKEN_REQUEST_TOKEN=x RUNNER_ENVIRONMENT=self-hosted
+check 'signing does not mind the permission, because it runs no native code' run_step setup.sh INPUT_MODE=sign INPUT_ALL_EXTENSIONS=true INPUT_PATH="$SRC" HAS_SIGNING_KEY=true ACTIONS_ID_TOKEN_REQUEST_TOKEN=x
 
 echo; echo '--- jobs stay apart'
 check_refused 'verify does not take the signing key' "Don't pass 'signing-key'" run_action verify_key INPUT_MODE=verify INPUT_SIGNING_KEY="$KEY"
 check_refused 'verify does not take S3 credentials' "Don't pass S3 credentials" run_action verify_creds INPUT_MODE=verify INPUT_S3_SECRET_ACCESS_KEY=b
-check_refused 'verify refuses credentials in the job' 'AWS credentials in its environment' run_action verify_env INPUT_MODE=verify AWS_SECRET_ACCESS_KEY=y
-check_refused 'and a session token' 'AWS credentials in its environment' run_action verify_token INPUT_MODE=verify AWS_SESSION_TOKEN=y
+for variable in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_PROFILE AWS_SHARED_CREDENTIALS_FILE; do
+	check_refused "verify refuses $variable in the job" "$variable in its environment" run_action "verify_$variable" INPUT_MODE=verify "$variable=do-not-print"
+	check_not_contains 'and does not print its value' "$RUN_LOG" 'do-not-print'
+done
+for variable in ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL; do
+	check_refused "verify refuses a job that can request an OIDC token, seen through $variable" "'id-token: write'" run_action "verify_$variable" INPUT_MODE=verify "$variable=do-not-print"
+	check_not_contains 'and does not print its value' "$RUN_LOG" 'do-not-print'
+done
 # One job has one RUNNER_TEMP.
 SHARED_TEMP="$RUNS_DIR/shared-temp"
 mkdir -p "$SHARED_TEMP"
@@ -971,7 +983,24 @@ check_contains 'the signing key can not be committed by accident' "$TESTS_ROOT/.
 check_contains 'the wasm test dependencies are locked' "$TESTS_ROOT/tests/wasm/run.sh" 'npm ci'
 check 'and the lockfile exists' test -f "$TESTS_ROOT/tests/wasm/package-lock.json"
 check_not_contains 'and is not ignored' "$TESTS_ROOT/tests/wasm/.gitignore" 'package-lock.json'
-for example in "$TESTS_ROOT/examples/release.yml" "$TESTS_ROOT/README.md"; do
+OIDC_EXAMPLE="$TESTS_ROOT/examples/release-aws-oidc.yml"
+# Which part of a workflow grants the permission: the name of a job, or "workflow" for all of them.
+id_token_grants() { # <workflow>
+	awk '
+		/^jobs:/ { in_jobs = 1; next }
+		in_jobs && /^  [a-z_-]+:$/ { job = $1; sub(":", "", job) }
+		/^ *id-token: write/ { print (in_jobs ? job : "workflow") }
+	' "$1" | tr '\n' ' '
+}
+check_equal 'the OIDC example only grants id-token to the publish job' 'publish ' "$(id_token_grants "$OIDC_EXAMPLE")"
+check_contains 'and takes every permission from the verify job' "$OIDC_EXAMPLE" 'permissions: {}'
+check_not_contains 'and has no storage keys' "$OIDC_EXAMPLE" 's3-access-key-id'
+check_not_contains 'and no endpoint' "$OIDC_EXAMPLE" 's3-endpoint'
+check_equal 'the role check only grants id-token to the publish job' 'publish ' "$(id_token_grants "$TESTS_ROOT/.github/workflows/aws-oidc-check.yml")"
+AWS_ACTION_PIN=$(grep -oE 'aws-actions/configure-aws-credentials@[0-9a-f]{40}' "$OIDC_EXAMPLE" | sort -u)
+check 'the OIDC example pins the AWS action by commit' test -n "$AWS_ACTION_PIN"
+check_equal 'and the README pins the same commit' "$AWS_ACTION_PIN" "$(grep -oE 'aws-actions/configure-aws-credentials@[0-9a-f]{40}' "$TESTS_ROOT/README.md" | sort -u)"
+for example in "$TESTS_ROOT/examples/release.yml" "$OIDC_EXAMPLE" "$TESTS_ROOT/README.md"; do
 	name=$(basename "$example")
 	check_contains "$name sets a concurrency group for publishing" "$example" 'cancel-in-progress: false'
 	check_contains "$name sets a timeout" "$example" 'timeout-minutes:'
