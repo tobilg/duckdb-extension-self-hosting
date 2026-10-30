@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Publishes real extensions to MinIO and installs them with the real DuckDB CLI. Needs Docker and network access.
+# Publishes real extensions to a local S3-compatible store and installs them with the real DuckDB CLI. Needs Docker and
+# network access.
 
 # shellcheck source=tests/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 export RUNS_DIR
 RUNS_DIR=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/duckdb-publisher-e2e.XXXXXX")" && pwd -P)
-trap 'bash "$TESTS_ROOT/tests/stop-minio.sh"; rm -rf "$RUNS_DIR"' EXIT
+trap 'bash "$TESTS_ROOT/tests/stop-s3.sh"; rm -rf "$RUNS_DIR"' EXIT
 export TEST_HOME="$RUNS_DIR/runner-home"
 mkdir -p "$TEST_HOME" "$RUNS_DIR/keys" "$RUNS_DIR/native" "$RUNS_DIR/stable" "$RUNS_DIR/wasm"
 
-for line in $(bash "$TESTS_ROOT/tests/start-minio.sh" "$RUNS_DIR/minio"); do
+SETTINGS=$(bash "$TESTS_ROOT/tests/start-s3.sh" "$RUNS_DIR/s3") || exit 1
+for line in $SETTINGS; do
 	eval "$line"
 done
 CA="$RCLONE_CA_CERT"

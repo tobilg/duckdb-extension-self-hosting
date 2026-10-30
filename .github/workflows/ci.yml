@@ -39,7 +39,7 @@ jobs:
       - run: /bin/bash tests/unit.sh
 
   e2e:
-    name: End to end on MinIO
+    name: End to end on S3-compatible storage
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -60,8 +60,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Start MinIO
-        run: bash tests/start-minio.sh "$RUNNER_TEMP/minio" >>"$GITHUB_ENV"
+      - name: Start an S3-compatible store
+        run: bash tests/start-s3.sh "$RUNNER_TEMP/s3" >>"$GITHUB_ENV"
       - name: Create a test key and fetch a real extension
         run: |
           openssl genrsa -out "$RUNNER_TEMP/test.pem" 2048

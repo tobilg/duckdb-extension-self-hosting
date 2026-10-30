@@ -9,7 +9,7 @@ It runs after DuckDB's standard build and does the rest in one step:
 - Uploads them to the paths DuckDB requests, along with an optional key file.
 - Installs and loads the result with the real DuckDB CLI.
 
-> **Status:** pre-release, and DuckDB's docs mark custom repositories as work in progress. It's tested against MinIO. A release from a real extension to Cloudflare R2 is still open, and `v1` follows once that has passed.
+> **Status:** pre-release, and DuckDB's docs mark custom repositories as work in progress. It's tested against a local S3-compatible store (SeaweedFS). A release from a real extension to Cloudflare R2 is still open, and `v1` follows once that has passed.
 
 ## Quick start
 
@@ -211,7 +211,7 @@ The Node.js bindings of DuckDB-Wasm can't use custom repositories at the moment:
 
 ```bash
 bash tests/unit.sh        # no network, no Docker
-bash tests/e2e.sh         # MinIO in Docker, real extensions, real DuckDB CLI
+bash tests/e2e.sh         # SeaweedFS in Docker, real extensions, real DuckDB CLI
 bash tests/wasm/run.sh    # DuckDB-Wasm in headless Chrome, needs Node.js
 ```
 
