@@ -1,0 +1,187 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: shellcheck
+        run: shellcheck -x scripts/*.sh tests/*.sh tests/wasm/run.sh
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+
+  hash-drift:
+    name: Vendored hash script matches DuckDB
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: |
+          curl -fsSL -o upstream.sh https://raw.githubusercontent.com/duckdb/duckdb/v2.0.0/scripts/compute-extension-hash.sh
+          cmp upstream.sh scripts/compute-extension-hash.sh
+
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # /bin/bash is 3.2 on macOS. That is the version upstream's upload script breaks on.
+      - run: /bin/bash tests/unit.sh
+
+  e2e:
+    name: End to end on MinIO
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: bash tests/e2e.sh
+
+  wasm:
+    name: Load signed builds in DuckDB-Wasm
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+      - run: bash tests/wasm/run.sh
+
+  action:
+    name: Run the action through uses
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Start MinIO
+        run: bash tests/start-minio.sh "$RUNNER_TEMP/minio" >>"$GITHUB_ENV"
+      - name: Create a test key and fetch a real extension
+        run: |
+          openssl genrsa -out "$RUNNER_TEMP/test.pem" 2048
+          {
+            echo 'TEST_SIGNING_KEY<<EOF'
+            cat "$RUNNER_TEMP/test.pem"
+            echo 'EOF'
+          } >>"$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/binaries"
+          curl -fsSL https://community-extensions.duckdb.org/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz |
+            gunzip >"$RUNNER_TEMP/binaries/rusty_quack.duckdb_extension"
+
+      - name: Publish
+        id: publish
+        uses: ./
+        with:
+          path: ${{ runner.temp }}/binaries
+          signing-key: ${{ env.TEST_SIGNING_KEY }}
+          s3-bucket: public-bucket
+          s3-prefix: repo
+          s3-endpoint: ${{ env.S3_ENDPOINT }}
+          s3-region: us-east-1
+          s3-access-key-id: ${{ env.S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ env.S3_SECRET_ACCESS_KEY }}
+          repository-url: ${{ env.S3_ENDPOINT }}/public-bucket/repo
+          smoke-test-setup-sql: INSTALL httpfs; LOAD httpfs; SET GLOBAL ca_cert_file = '${{ env.RCLONE_CA_CERT }}';
+
+      - name: Check the outputs
+        env:
+          FINGERPRINT: ${{ steps.publish.outputs.fingerprint }}
+          SIGNED_DIR: ${{ steps.publish.outputs.signed-dir }}
+          FILES: ${{ steps.publish.outputs.files }}
+          REPOSITORY_URL: ${{ steps.publish.outputs.repository-url }}
+        run: |
+          set -x
+          [[ "$FINGERPRINT" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$REPOSITORY_URL" = "$S3_ENDPOINT/public-bucket/repo"
+          test -f "$SIGNED_DIR/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz"
+          test "$(jq 'length' <<<"$FILES")" = 2
+          test "$(jq -r '.[0].name' <<<"$FILES")" = rusty_quack
+          curl -fsS --cacert "$RCLONE_CA_CERT" -o /dev/null "$REPOSITORY_URL/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz"
+          curl -fsS --cacert "$RCLONE_CA_CERT" -o /dev/null "$REPOSITORY_URL/.well-known/duckdb-extension-repo.json"
+
+      - name: Publish the same release again
+        uses: ./
+        with:
+          path: ${{ runner.temp }}/binaries
+          signing-key: ${{ env.TEST_SIGNING_KEY }}
+          s3-bucket: public-bucket
+          s3-prefix: repo
+          s3-endpoint: ${{ env.S3_ENDPOINT }}
+          s3-region: us-east-1
+          s3-access-key-id: ${{ env.S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ env.S3_SECRET_ACCESS_KEY }}
+          smoke-test: 'false'
+
+      - name: An empty signing key fails
+        id: empty-key
+        continue-on-error: true
+        uses: ./
+        with:
+          path: ${{ runner.temp }}/binaries
+          signing-key: ''
+          mode: sign-only
+      - name: Check that it failed
+        if: steps.empty-key.outcome != 'failure'
+        run: exit 1
+
+  make-artifacts:
+    name: Build fake artifacts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: |
+          source tests/lib.sh
+          make_extension artifacts/linux/demo.duckdb_extension linux_amd64 v2.0.0 v1.0.0 CPP 3000000
+          make_extension artifacts/mac/demo.duckdb_extension osx_arm64 v2.0.0 v1.0.0 CPP 3000000
+          make_extension artifacts/other/other.duckdb_extension linux_amd64 v2.0.0 v1.0.0 CPP 3000
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: demo-v2.0.0-extension-linux_amd64
+          path: artifacts/linux
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: demo-v2.0.0-extension-osx_arm64
+          path: artifacts/mac
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: other-v2.0.0-extension-linux_amd64
+          path: artifacts/other
+
+  from-artifacts:
+    name: Sign downloaded artifacts
+    needs: make-artifacts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Create a test key
+        run: |
+          openssl genrsa -out "$RUNNER_TEMP/test.pem" 2048
+          {
+            echo 'TEST_SIGNING_KEY<<EOF'
+            cat "$RUNNER_TEMP/test.pem"
+            echo 'EOF'
+          } >>"$GITHUB_ENV"
+      - name: Sign
+        id: sign
+        uses: ./
+        with:
+          extension-name: demo
+          signing-key: ${{ env.TEST_SIGNING_KEY }}
+          mode: sign-only
+      - name: Check that it only picked up the demo artifacts
+        env:
+          SIGNED_DIR: ${{ steps.sign.outputs.signed-dir }}
+          FILES: ${{ steps.sign.outputs.files }}
+        run: |
+          set -x
+          test -f "$SIGNED_DIR/v2.0.0/linux_amd64/demo.duckdb_extension.gz"
+          test -f "$SIGNED_DIR/v2.0.0/osx_arm64/demo.duckdb_extension.gz"
+          test -f "$SIGNED_DIR/demo/v1.0.0/v2.0.0/osx_arm64/demo.duckdb_extension.gz"
+          test ! -e "$SIGNED_DIR/v2.0.0/linux_amd64/other.duckdb_extension.gz"
+          test "$(jq 'length' <<<"$FILES")" = 4

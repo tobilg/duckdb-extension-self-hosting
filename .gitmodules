@@ -1,0 +1,11 @@
+[submodule "duckdb"]
+	path = duckdb
+	url = https://github.com/duckdb/duckdb.git
+[submodule "duckdb-web"]
+	path = duckdb-web
+	url = https://github.com/duckdb/duckdb-web.git
+	branch = main
+[submodule "duckdb-wasm"]
+	path = duckdb-wasm
+	url = https://github.com/duckdb/duckdb-wasm.git
+	branch = main
