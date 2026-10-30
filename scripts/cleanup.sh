@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Removes the private key and intermediate files. Runs even if an earlier step failed, and keeps signed-dir for later steps.
+# Removes intermediate files, and the private key if something killed sign.sh before it could. Runs even if an earlier step
+# failed, and keeps the signed tree for later steps.
 
 set -uo pipefail
 

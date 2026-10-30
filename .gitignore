@@ -1,1 +1,12 @@
 blog/
+
+# Local state, and anything that must never be committed.
+.DS_Store
+.wrangler/
+tmp/
+*.pem
+
+# Former reference submodules. Their sources are linked in the README.
+/duckdb/
+/duckdb-web/
+/duckdb-wasm/
