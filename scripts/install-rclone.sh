@@ -32,7 +32,7 @@ require_tool unzip
 
 name="rclone-$RCLONE_VERSION-$asset"
 archive="$WORK_DIR/tmp/$name.zip"
-curl -fsSL --retry 3 -o "$archive" "https://github.com/rclone/rclone/releases/download/$RCLONE_VERSION/$name.zip"
+curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 -o "$archive" "https://github.com/rclone/rclone/releases/download/$RCLONE_VERSION/$name.zip"
 
 actual=$(sha256_of "$archive")
 [ "$actual" = "$expected" ] || die "The rclone download has an unexpected hash: $actual"

@@ -11,6 +11,7 @@ permissions:
 jobs:
   lint:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: shellcheck
@@ -18,14 +19,18 @@ jobs:
       - name: actionlint
         run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
 
-  hash-drift:
-    name: Vendored hash script matches DuckDB
+  pins:
+    name: Vendored hash script and pinned rclone match upstream
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - run: |
+      - name: Vendored hash script
+        run: |
           curl -fsSL -o upstream.sh https://raw.githubusercontent.com/duckdb/duckdb/v2.0.0/scripts/compute-extension-hash.sh
           cmp upstream.sh scripts/compute-extension-hash.sh
+      - name: Pinned rclone
+        run: bash tests/rclone-pin.sh
 
   unit:
     strategy:
@@ -33,14 +38,21 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # /bin/bash is 3.2 on macOS. That is the version upstream's upload script breaks on.
       - run: /bin/bash tests/unit.sh
+      # The publish jobs below can't run on macOS without Docker, so this covers its rclone download.
+      - name: Install the pinned rclone
+        run: |
+          mkdir -p "$RUNNER_TEMP/rclone/tmp"
+          WORK_DIR="$RUNNER_TEMP/rclone" /bin/bash scripts/install-rclone.sh
 
   e2e:
     name: End to end on S3-compatible storage
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - run: bash tests/e2e.sh
@@ -48,6 +60,7 @@ jobs:
   wasm:
     name: Load signed builds in DuckDB-Wasm
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
@@ -55,14 +68,15 @@ jobs:
           node-version: 24
       - run: bash tests/wasm/run.sh
 
-  action:
-    name: Run the action through uses
+  action-sign:
+    name: Run the sign job through uses
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      bundle-digest: ${{ steps.sign.outputs.bundle-digest }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Start an S3-compatible store
-        run: bash tests/start-s3.sh "$RUNNER_TEMP/s3" >>"$GITHUB_ENV"
-      - name: Create a test key and fetch a real extension
+      - name: Create a test key and fetch real extensions
         run: |
           openssl genrsa -out "$RUNNER_TEMP/test.pem" 2048
           {
@@ -70,16 +84,111 @@ jobs:
             cat "$RUNNER_TEMP/test.pem"
             echo 'EOF'
           } >>"$GITHUB_ENV"
-          mkdir -p "$RUNNER_TEMP/binaries"
-          curl -fsSL https://community-extensions.duckdb.org/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz |
-            gunzip >"$RUNNER_TEMP/binaries/rusty_quack.duckdb_extension"
+          source tests/lib.sh
+          fetch_fixture community v2.0.0/linux_amd64/rusty_quack.duckdb_extension "$RUNNER_TEMP/binaries/linux/rusty_quack.duckdb_extension"
+          fetch_fixture community v2.0.0/osx_arm64/rusty_quack.duckdb_extension "$RUNNER_TEMP/binaries/mac/rusty_quack.duckdb_extension"
+
+      - name: Sign
+        id: sign
+        uses: ./
+        with:
+          mode: sign
+          extension-name: rusty_quack
+          path: ${{ runner.temp }}/binaries
+          signing-key: ${{ env.TEST_SIGNING_KEY }}
+          signed-artifact: ci-signed
+
+      - name: Check the outputs
+        env:
+          FINGERPRINT: ${{ steps.sign.outputs.fingerprint }}
+          SIGNED_DIR: ${{ steps.sign.outputs.signed-dir }}
+          FILES: ${{ steps.sign.outputs.files }}
+          DIGEST: ${{ steps.sign.outputs.bundle-digest }}
+        run: |
+          set -x
+          [[ "$FINGERPRINT" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          test -f "$SIGNED_DIR/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz"
+          test -f "$SIGNED_DIR/.well-known/duckdb-extension-repo.json"
+          test "$(jq 'length' <<<"$FILES")" = 4
+          test "$(jq -r '.[0].name' <<<"$FILES")" = rusty_quack
+
+      - name: An empty signing key fails
+        id: empty-key
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: sign
+          extension-name: rusty_quack
+          path: ${{ runner.temp }}/binaries
+          signing-key: ''
+          signed-artifact: ci-never-uploaded
+      - name: Check that it failed
+        if: steps.empty-key.outcome != 'failure'
+        run: exit 1
+
+  action-verify:
+    name: Run the verify job through uses
+    needs: action-sign
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Verify
+        id: verify
+        uses: ./
+        with:
+          mode: verify
+          signed-artifact: ci-signed
+          bundle-digest: ${{ needs.action-sign.outputs.bundle-digest }}
+
+      - name: Check that the tree made it through the artifact store
+        env:
+          SIGNED_DIR: ${{ steps.verify.outputs.signed-dir }}
+          FINGERPRINT: ${{ steps.verify.outputs.fingerprint }}
+        run: |
+          set -x
+          test -f "$SIGNED_DIR/.well-known/duckdb-extension-repo.json"
+          [[ "$FINGERPRINT" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+      - name: Setup SQL that fails
+        id: failed-smoke
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: verify
+          signed-artifact: ci-signed
+          smoke-test-setup-sql: this is not SQL
+      - name: Check that it failed, and still reported what it tested
+        env:
+          OUTCOME: ${{ steps.failed-smoke.outcome }}
+          FILES: ${{ steps.failed-smoke.outputs.files }}
+        run: |
+          set -x
+          test "$OUTCOME" = failure
+          test "$(jq 'length' <<<"$FILES")" = 4
+
+  action-publish:
+    name: Run the publish job through uses
+    needs: [action-sign, action-verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Start an S3-compatible store
+        run: bash tests/start-s3.sh "$RUNNER_TEMP/s3" >>"$GITHUB_ENV"
 
       - name: Publish
         id: publish
         uses: ./
         with:
-          path: ${{ runner.temp }}/binaries
-          signing-key: ${{ env.TEST_SIGNING_KEY }}
+          mode: publish
+          signed-artifact: ci-signed
+          bundle-digest: ${{ needs.action-sign.outputs.bundle-digest }}
           s3-bucket: public-bucket
           s3-prefix: repo
           s3-endpoint: ${{ env.S3_ENDPOINT }}
@@ -87,52 +196,97 @@ jobs:
           s3-access-key-id: ${{ env.S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ env.S3_SECRET_ACCESS_KEY }}
           repository-url: ${{ env.S3_ENDPOINT }}/public-bucket/repo
-          smoke-test-setup-sql: INSTALL httpfs; LOAD httpfs; SET GLOBAL ca_cert_file = '${{ env.RCLONE_CA_CERT }}';
 
       - name: Check the outputs
         env:
           FINGERPRINT: ${{ steps.publish.outputs.fingerprint }}
-          SIGNED_DIR: ${{ steps.publish.outputs.signed-dir }}
           FILES: ${{ steps.publish.outputs.files }}
+          UPLOADED: ${{ steps.publish.outputs.uploaded-objects }}
           REPOSITORY_URL: ${{ steps.publish.outputs.repository-url }}
         run: |
           set -x
           [[ "$FINGERPRINT" =~ ^sha256:[0-9a-f]{64}$ ]]
           test "$REPOSITORY_URL" = "$S3_ENDPOINT/public-bucket/repo"
-          test -f "$SIGNED_DIR/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz"
-          test "$(jq 'length' <<<"$FILES")" = 2
-          test "$(jq -r '.[0].name' <<<"$FILES")" = rusty_quack
-          curl -fsS --cacert "$RCLONE_CA_CERT" -o /dev/null "$REPOSITORY_URL/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz"
-          curl -fsS --cacert "$RCLONE_CA_CERT" -o /dev/null "$REPOSITORY_URL/.well-known/duckdb-extension-repo.json"
+          test "$(jq 'length' <<<"$FILES")" = 4
+          test "$(jq 'length' <<<"$UPLOADED")" = 5
+          curl -fsS -o /dev/null "$REPOSITORY_URL/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz"
+          curl -fsS -o /dev/null "$REPOSITORY_URL/.well-known/duckdb-extension-repo.json"
 
       - name: Publish the same release again
         uses: ./
         with:
-          path: ${{ runner.temp }}/binaries
-          signing-key: ${{ env.TEST_SIGNING_KEY }}
+          mode: publish
+          signed-artifact: ci-signed
+          bundle-digest: ${{ needs.action-sign.outputs.bundle-digest }}
           s3-bucket: public-bucket
           s3-prefix: repo
           s3-endpoint: ${{ env.S3_ENDPOINT }}
           s3-region: us-east-1
           s3-access-key-id: ${{ env.S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ env.S3_SECRET_ACCESS_KEY }}
-          smoke-test: 'false'
+          check-repository: 'false'
 
-      - name: An empty signing key fails
-        id: empty-key
+      - name: A wrong digest stops the upload
+        id: wrong-digest
         continue-on-error: true
         uses: ./
         with:
+          mode: publish
+          signed-artifact: ci-signed
+          bundle-digest: '0000000000000000000000000000000000000000000000000000000000000000'
+          s3-bucket: public-bucket
+          s3-prefix: wrong-digest
+          s3-endpoint: ${{ env.S3_ENDPOINT }}
+          s3-region: us-east-1
+          s3-access-key-id: ${{ env.S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ env.S3_SECRET_ACCESS_KEY }}
+      - name: Check that it failed and uploaded nothing
+        env:
+          OUTCOME: ${{ steps.wrong-digest.outcome }}
+        run: |
+          set -x
+          test "$OUTCOME" = failure
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$S3_ENDPOINT/public-bucket/wrong-digest/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz")" = 404
+
+  action-one-job:
+    name: Refuse to run native code in a job with secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Create a test key and a build
+        run: |
+          openssl genrsa -out "$RUNNER_TEMP/test.pem" 2048
+          {
+            echo 'TEST_SIGNING_KEY<<EOF'
+            cat "$RUNNER_TEMP/test.pem"
+            echo 'EOF'
+          } >>"$GITHUB_ENV"
+          source tests/lib.sh
+          make_extension "$RUNNER_TEMP/binaries/demo.duckdb_extension" linux_amd64 v2.0.0 v1.0.0 CPP 3000
+      - name: Sign
+        uses: ./
+        with:
+          mode: sign
+          extension-name: demo
           path: ${{ runner.temp }}/binaries
-          signing-key: ''
-          mode: sign-only
+          signing-key: ${{ env.TEST_SIGNING_KEY }}
+          signed-artifact: ci-one-job
+      - name: Verify in the same job
+        id: same-job
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: verify
+          signed-artifact: ci-one-job
       - name: Check that it failed
-        if: steps.empty-key.outcome != 'failure'
+        if: steps.same-job.outcome != 'failure'
         run: exit 1
 
   make-artifacts:
     name: Build fake artifacts
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - run: |
@@ -157,6 +311,7 @@ jobs:
     name: Sign downloaded artifacts
     needs: make-artifacts
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Create a test key
@@ -171,9 +326,10 @@ jobs:
         id: sign
         uses: ./
         with:
+          mode: sign
           extension-name: demo
           signing-key: ${{ env.TEST_SIGNING_KEY }}
-          mode: sign-only
+          signed-artifact: ci-from-artifacts
       - name: Check that it only picked up the demo artifacts
         env:
           SIGNED_DIR: ${{ steps.sign.outputs.signed-dir }}

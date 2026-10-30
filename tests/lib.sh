@@ -47,13 +47,26 @@ check_not_contains() { # <description> <file> <text>
 	if grep -Fq -- "$3" "$2"; then fail "$1" "'$3' found in $2"; else pass "$1"; fi
 }
 
+# That a run fails is only worth something if it fails for the expected reason, so this also checks the log.
+check_refused() { # <description> <text in the log> <run_action or similar...>
+	local description=$1 text=$2
+	shift 2
+	if "$@" >/dev/null 2>&1; then
+		fail "$description" "the command succeeded: $*"
+	elif grep -Fq -- "$text" "$RUN_LOG"; then
+		pass "$description"
+	else
+		fail "$description" "'$text' not found in: $(tail -n 3 "$RUN_LOG" | cut -c1-300 | tr '\n' ' ')"
+	fi
+}
+
 finish() {
 	printf '\n%d checks, %d failed\n' "$tests_run" "$tests_failed"
 	[ "$tests_failed" = "0" ]
 }
 
-# Runs the action with a clean environment, so nothing leaks in from the caller's shell. Sets RUN_LOG, RUN_OUTPUT and
-# RUN_SUMMARY, and returns the action's exit status.
+# Runs one job of the action with a clean environment, so nothing leaks in from the caller's shell. Each run gets its own
+# RUNNER_TEMP, like a job does. Sets RUN_LOG, RUN_OUTPUT and RUN_SUMMARY, and returns the action's exit status.
 run_action() { # <run name> [VAR=value...]
 	local name=$1
 	shift
@@ -62,7 +75,8 @@ run_action() { # <run name> [VAR=value...]
 	RUN_SUMMARY="$RUNS_DIR/$name.summary"
 	: >"$RUN_OUTPUT"
 	: >"$RUN_SUMMARY"
-	env -i PATH="$PATH" HOME="${TEST_HOME:-$HOME}" TMPDIR="$RUNS_DIR" RUNNER_TEMP="$RUNS_DIR" \
+	mkdir -p "$RUNS_DIR/$name.runner-temp"
+	env -i PATH="$PATH" HOME="${TEST_HOME:-$HOME}" TMPDIR="$RUNS_DIR" RUNNER_TEMP="$RUNS_DIR/$name.runner-temp" \
 		RUN_OUTPUT_FILE="$RUN_OUTPUT" RUN_SUMMARY_FILE="$RUN_SUMMARY" "$@" \
 		"${BASH:-bash}" "$TESTS_ROOT/tests/run-action.sh" >"$RUN_LOG" 2>&1
 }
@@ -70,6 +84,14 @@ run_action() { # <run name> [VAR=value...]
 output_value() { # <name>
 	sed -n "s/^$1=//p" "$RUN_OUTPUT" | sed -n 1p
 }
+
+# The value of an output in the block form.
+output_block() { # <name>
+	sed -n "/^$1<</,/^EOF_/p" "$RUN_OUTPUT" | sed -n 2p
+}
+
+# The signed tree of the sign job that just ran, the way a later job would download it.
+bundle_dir() { dirname "$(output_value signed-dir)"; }
 
 # Writes a file with the structure of a built extension: payload, 256 bytes of metadata, 256 zero bytes of signature.
 make_extension() { # <file> <platform> <duckdb version> <extension version> <abi> <payload bytes>
@@ -83,6 +105,46 @@ make_extension() { # <file> <platform> <duckdb version> <extension version> <abi
 		head -c $((32 - ${#field})) /dev/zero >>"$file"
 	done
 	head -c 256 /dev/zero >>"$file"
+}
+
+# Overwrites a 32-byte field of the footer, addressed by its offset from the end of the file. The payload stays intact.
+set_footer_field() { # <file> <offset from end> <value>
+	local size
+	size=$(wc -c <"$1" | tr -d '[:space:]')
+	{
+		printf '%s' "$3"
+		head -c $((32 - ${#3})) /dev/zero
+	} | dd of="$1" bs=1 seek=$((size - $2)) conv=notrunc 2>/dev/null
+}
+
+# Downloads an extension from DuckDB's servers and unpacks it. Checks it against tests/fixtures.sha256, so that a change on
+# those servers fails here with a clear message, instead of looking like a bug in this project.
+fetch_fixture() { # <community or core> <version>/<platform>/<file name> <output file>
+	local source=$1 key=$2 output=$3 url expected actual
+	case "$source" in
+	community) url="https://community-extensions.duckdb.org/$key" ;;
+	core) url="https://extensions.duckdb.org/$key" ;;
+	*)
+		echo "unknown fixture source: $source" >&2
+		return 1
+		;;
+	esac
+	case "$key" in
+	*.duckdb_extension) url="$url.gz" ;;
+	esac
+	expected=$(awk -v key="$source/$key" '$2 == key { print $1 }' "$TESTS_ROOT/tests/fixtures.sha256")
+	if [ -z "$expected" ]; then
+		echo "$source/$key is not in tests/fixtures.sha256" >&2
+		return 1
+	fi
+	mkdir -p "$(dirname "$output")"
+	curl -fsS --compressed --retry 3 -o "$output" "$url" || return 1
+	if gunzip -c "$output" >"$output.plain" 2>/dev/null; then mv "$output.plain" "$output"; else rm -f "$output.plain"; fi
+	actual=$(sha256_file "$output")
+	if [ "$actual" != "$expected" ]; then
+		echo "$url changed upstream: expected $expected, got $actual. If that's expected, update tests/fixtures.sha256." >&2
+		return 1
+	fi
 }
 
 # The hash DuckDB signs, computed independently of the vendored script.

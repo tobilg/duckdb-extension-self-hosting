@@ -23,7 +23,7 @@ mkdir -p "$TEST_HOME" "$RUNS_DIR/keys" "$RUNS_DIR/source" "$RUNS_DIR/page"
 REPOSITORY="$RUNS_DIR/repository"
 
 if [ ! -d "$HERE/node_modules/@duckdb/duckdb-wasm" ]; then
-	(cd "$HERE" && npm install --no-audit --no-fund --silent --no-package-lock) || exit 1
+	(cd "$HERE" && npm ci --no-audit --no-fund --silent) || exit 1
 fi
 
 for key in one two; do
@@ -31,19 +31,14 @@ for key in one two; do
 	openssl rsa -in "$RUNS_DIR/keys/$key.pem" -pubout -out "$RUNS_DIR/keys/$key.pub" 2>/dev/null
 done
 
-curl -fsS --compressed -o "$RUNS_DIR/source/capi_quack.duckdb_extension.wasm" https://community-extensions.duckdb.org/v2.0.0/wasm_eh/capi_quack.duckdb_extension.wasm || exit 1
-curl -fsS --compressed -o "$RUNS_DIR/source/inet.duckdb_extension.wasm" https://extensions.duckdb.org/v2.0.0/wasm_eh/inet.duckdb_extension.wasm || exit 1
+fetch_fixture community v2.0.0/wasm_eh/capi_quack.duckdb_extension.wasm "$RUNS_DIR/source/capi_quack.duckdb_extension.wasm" || exit 1
+fetch_fixture core v2.0.0/wasm_eh/inet.duckdb_extension.wasm "$RUNS_DIR/source/inet.duckdb_extension.wasm" || exit 1
 
-# Rewrites the DuckDB version in the footer of the CPP build, 352 bytes from the end.
-INET="$RUNS_DIR/source/inet.duckdb_extension.wasm"
-SIZE=$(wc -c <"$INET" | tr -d '[:space:]')
-{
-	printf '%s' "$VERSION_DIR"
-	head -c $((32 - ${#VERSION_DIR})) /dev/zero
-} | dd of="$INET" bs=1 seek=$((SIZE - 352)) conv=notrunc 2>/dev/null
+# Rewrites the DuckDB version in the footer of the CPP build.
+set_footer_field "$RUNS_DIR/source/inet.duckdb_extension.wasm" 352 "$VERSION_DIR"
 
 sign_into() { # <route> <key>
-	if ! run_action "sign-$1" INPUT_MODE=sign-only INPUT_PATH="$RUNS_DIR/source" INPUT_SIGNING_KEY="$(cat "$RUNS_DIR/keys/$2.pem")" INPUT_DUCKDB_VERSION="$VERSION_DIR"; then
+	if ! run_action "sign-$1" INPUT_MODE=sign INPUT_ALL_EXTENSIONS=true INPUT_PATH="$RUNS_DIR/source" INPUT_SIGNING_KEY="$(cat "$RUNS_DIR/keys/$2.pem")" INPUT_DUCKDB_VERSION="$VERSION_DIR"; then
 		echo "signing for $1 failed:"
 		cat "$RUN_LOG"
 		exit 1

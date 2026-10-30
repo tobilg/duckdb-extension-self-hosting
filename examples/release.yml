@@ -1,5 +1,5 @@
 # A complete release workflow for an extension based on duckdb/extension-template.
-# Pushing a tag builds every platform, signs the binaries and publishes them to your repository.
+# Pushing a tag builds every platform, signs the binaries, tests them and publishes them to your repository.
 name: Release extension
 
 on:
@@ -17,19 +17,56 @@ jobs:
       ci_tools_version: v2.0-cyanoptera
       extension_name: my_ext
 
-  publish:
+  # Has the signing key, and never runs your extension's code. Environment secrets with required reviewers keep the key away
+  # from everything else in the repository.
+  sign:
     needs: build
     runs-on: ubuntu-24.04
-    # Environment secrets with required reviewers keep the signing key away from everything else in the repository.
-    environment: release
+    timeout-minutes: 30
+    environment: release-signing
+    outputs:
+      bundle-digest: ${{ steps.sign.outputs.bundle-digest }}
     steps:
-      # Pin the commit of a release instead of the tag, since this step handles your signing key.
-      - uses: tobilg/duckdb-extension-self-hosting@v1
+      # Replace <commit-sha> with the commit of a release: this step handles your signing key.
+      - id: sign
+        uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
         with:
+          mode: sign
           extension-name: my_ext
           signing-key: ${{ secrets.EXTENSION_SIGNING_KEY }}
           # Listed in the key file, so that clients can pin it too. See "Rotating keys" in the README.
           additional-public-keys: ${{ vars.EXTENSION_RESERVE_PUBLIC_KEY }}
+
+  # Runs your extension's code, so it has no secrets at all. Each runner tests its own platform, so add every type you can.
+  verify:
+    needs: sign
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions: {}
+    steps:
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+        with:
+          mode: verify
+
+  # Has the storage credentials, and only runs after every verify job has passed.
+  publish:
+    needs: [sign, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release-storage
+    # Releases go out one at a time: uploads of two runs could otherwise mix on the latest paths.
+    concurrency:
+      group: publish-my_ext
+      cancel-in-progress: false
+    steps:
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+        with:
+          mode: publish
+          bundle-digest: ${{ needs.sign.outputs.bundle-digest }}
           s3-endpoint: ${{ secrets.S3_ENDPOINT }}
           s3-bucket: my-extensions
           s3-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}

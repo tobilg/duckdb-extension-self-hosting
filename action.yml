@@ -1,14 +1,27 @@
 name: DuckDB Extension Publisher
-description: Sign DuckDB extensions with your own key and publish them to a custom extension repository on S3-compatible storage.
+description: Sign DuckDB extensions with your own key, test them, and publish them to a custom extension repository on S3-compatible storage.
 author: tobilg
 branding:
   icon: package
   color: yellow
 
 inputs:
-  extension-name:
-    description: Extension to publish. Selects the build artifacts, and skips any other extension found in them.
+  mode:
+    description: "Which job this is, each in its own: 'sign' signs the builds, 'verify' installs and loads them with the real DuckDB CLI, and 'publish' uploads them."
+    required: true
+  signed-artifact:
+    description: Name of the workflow artifact that takes the signed tree from the sign job to the later jobs. Change it if a workflow run signs more than once.
     required: false
+    default: duckdb-extension-signed
+
+  # Mode 'sign'
+  extension-name:
+    description: Extension to sign. Selects the build artifacts, and skips any other extension found in them.
+    required: false
+  all-extensions:
+    description: Sign every extension found in 'path' or 'artifact-pattern', instead of only 'extension-name'.
+    required: false
+    default: 'false'
   artifact-pattern:
     description: Glob for the workflow artifacts to download. Defaults to <extension-name>-*-extension-*.
     required: false
@@ -16,26 +29,44 @@ inputs:
     description: Directory that already holds the binaries. When set, no artifacts are downloaded.
     required: false
   signing-key:
-    description: RSA-2048 private key in PEM format. Pass it from a secret.
-    required: true
+    description: RSA-2048 private key in PEM format. Pass it from a secret. Only mode 'sign' accepts it.
+    required: false
   additional-public-keys:
     description: Further public keys to list in the key file, such as a reserve key for rotation. One or more PEM blocks.
     required: false
-  mode:
-    description: "'publish' signs and uploads. 'sign-only' stops after signing and leaves a repository tree in signed-dir."
-    required: false
-    default: publish
   exclude-platforms:
-    description: Comma or space separated platforms to skip, such as wasm_mvp.
+    description: Comma or space separated platforms to skip, such as wasm_mvp. Takes * and ? as wildcards, such as wasm_*.
     required: false
   duckdb-version:
-    description: DuckDB version directory, or a comma separated list. Only required for C_STRUCT builds. Other builds take it from their footer.
+    description: DuckDB version directory with its leading v, such as v2.0.0, or a comma separated list. Only required for C_STRUCT builds. Other builds take it from their footer.
     required: false
   extension-version:
     description: Version used in the versioned path. Defaults to the version in the footer.
     required: false
+  upload-latest:
+    description: Include <duckdb_version>/<platform>/, which INSTALL reads by default.
+    required: false
+    default: 'true'
+  upload-versioned:
+    description: Include <name>/<extension_version>/<duckdb_version>/<platform>/, which INSTALL ... VERSION reads.
+    required: false
+    default: 'true'
+  publish-key-file:
+    description: Include .well-known/duckdb-extension-repo.json.
+    required: false
+    default: 'true'
+
+  # Mode 'verify'
+  smoke-test-setup-sql:
+    description: SQL to run in the smoke test before the repository is created, such as loading an extension yours depends on.
+    required: false
+
+  # Mode 'publish'
+  bundle-digest:
+    description: The output of the same name from the sign job. Required in mode 'publish', which refuses a signed tree that changed since.
+    required: false
   s3-bucket:
-    description: Bucket to publish to. Required in publish mode.
+    description: Bucket to publish to. Required in mode 'publish'.
     required: false
   s3-prefix:
     description: Key prefix inside the bucket.
@@ -44,7 +75,7 @@ inputs:
     description: S3 API endpoint, such as https://<account_id>.r2.cloudflarestorage.com. Leave empty for AWS.
     required: false
   s3-region:
-    description: Bucket region. Falls back to AWS_REGION, and to auto on R2.
+    description: Bucket region. Falls back to auto on R2, and to AWS_REGION elsewhere.
     required: false
   s3-provider:
     description: rclone S3 provider. Detected from the endpoint when empty.
@@ -58,71 +89,77 @@ inputs:
   s3-session-token:
     description: Session token. Falls back to AWS_SESSION_TOKEN.
     required: false
-  upload-latest:
-    description: Upload to <duckdb_version>/<platform>/, which INSTALL reads by default.
-    required: false
-    default: 'true'
-  upload-versioned:
-    description: Upload to <name>/<extension_version>/<duckdb_version>/<platform>/, which INSTALL ... VERSION reads.
-    required: false
-    default: 'true'
   overwrite-versioned:
     description: Allow replacing a versioned object with different bytes. By default that fails the run.
     required: false
     default: 'false'
-  publish-key-file:
-    description: Publish .well-known/duckdb-extension-repo.json.
+  allow-key-change:
+    description: Allow a signing key that isn't in the bucket's key file, for a key rotation. By default that fails the run.
     required: false
-    default: 'true'
-  smoke-test:
-    description: After uploading, install and load the extension with the matching DuckDB CLI on this runner.
+    default: 'false'
+  allow-downgrade:
+    description: Allow moving the latest path to a lower version. By default that fails the run.
     required: false
-    default: 'true'
+    default: 'false'
   repository-url:
-    description: Public prefix clients use, such as https://extensions.example.com. Without it, the smoke test and summary use s3://<bucket>/<prefix>.
+    description: Public prefix clients use, such as https://extensions.example.com. Without it, the check and summary use s3://<bucket>/<prefix>.
     required: false
-  smoke-test-setup-sql:
-    description: SQL to run in the smoke test before the repository is created, such as a custom CA file.
+  check-repository:
+    description: After uploading, read every object back through repository-url and compare the bytes. Runs no downloaded code.
     required: false
+    default: 'true'
 
 outputs:
   fingerprint:
     description: SHA-256 fingerprint of the signing key, in the format DuckDB reports it.
-    value: ${{ steps.setup.outputs.fingerprint }}
+    value: ${{ steps.sign.outputs.fingerprint || steps.bundle.outputs.fingerprint }}
   signed-dir:
     description: Directory with the signed files, laid out like the repository.
-    value: ${{ steps.sign.outputs.signed-dir }}
+    value: ${{ steps.sign.outputs.signed-dir || steps.bundle.outputs.signed-dir }}
+  bundle-digest:
+    description: Digest of the signed tree. Pass it from the sign job to the input of the same name in the publish job.
+    value: ${{ steps.sign.outputs.bundle-digest }}
   files:
-    description: JSON array with platform, versions, ABI, object path and SHA-256 of each file.
+    description: JSON array with platform, versions, ABI and object path of each file, the SHA-256 of the object (sha256) and of the binary inside it (binary_sha256).
     value: ${{ steps.summary.outputs.files }}
+  uploaded-objects:
+    description: JSON array of the object paths this run uploaded or confirmed, in mode 'publish'. Shorter than files if the upload failed partway.
+    value: ${{ steps.summary.outputs.uploaded-objects }}
   repository-url:
-    description: Prefix clients use for CREATE EXTENSION REPOSITORY. Empty in sign-only mode.
+    description: Prefix clients use for CREATE EXTENSION REPOSITORY, in mode 'publish'.
     value: ${{ steps.summary.outputs.repository-url }}
 
 runs:
   using: composite
   steps:
-    - name: Check inputs and load the signing key
+    - name: Check inputs
       id: setup
       shell: bash
       env:
-        INPUT_SIGNING_KEY: ${{ inputs.signing-key }}
-        INPUT_ADDITIONAL_PUBLIC_KEYS: ${{ inputs.additional-public-keys }}
         INPUT_MODE: ${{ inputs.mode }}
         INPUT_EXTENSION_NAME: ${{ inputs.extension-name }}
+        INPUT_ALL_EXTENSIONS: ${{ inputs.all-extensions }}
         INPUT_ARTIFACT_PATTERN: ${{ inputs.artifact-pattern }}
         INPUT_PATH: ${{ inputs.path }}
+        INPUT_BUNDLE_DIGEST: ${{ inputs.bundle-digest }}
         INPUT_S3_BUCKET: ${{ inputs.s3-bucket }}
         INPUT_S3_ENDPOINT: ${{ inputs.s3-endpoint }}
+        INPUT_REPOSITORY_URL: ${{ inputs.repository-url }}
         INPUT_UPLOAD_LATEST: ${{ inputs.upload-latest }}
         INPUT_UPLOAD_VERSIONED: ${{ inputs.upload-versioned }}
         INPUT_OVERWRITE_VERSIONED: ${{ inputs.overwrite-versioned }}
         INPUT_PUBLISH_KEY_FILE: ${{ inputs.publish-key-file }}
-        INPUT_SMOKE_TEST: ${{ inputs.smoke-test }}
-      run: bash "$GITHUB_ACTION_PATH/scripts/setup-key.sh"
+        INPUT_ALLOW_KEY_CHANGE: ${{ inputs.allow-key-change }}
+        INPUT_ALLOW_DOWNGRADE: ${{ inputs.allow-downgrade }}
+        INPUT_CHECK_REPOSITORY: ${{ inputs.check-repository }}
+        HAS_SIGNING_KEY: ${{ inputs.signing-key != '' }}
+        HAS_S3_ACCESS_KEY_ID: ${{ inputs.s3-access-key-id != '' }}
+        HAS_S3_SECRET_ACCESS_KEY: ${{ inputs.s3-secret-access-key != '' }}
+        HAS_S3_SESSION_TOKEN: ${{ inputs.s3-session-token != '' }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/setup.sh"
 
     - name: Download build artifacts
-      if: inputs.path == ''
+      if: inputs.mode == 'sign' && inputs.path == ''
       uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
         pattern: ${{ inputs.artifact-pattern != '' && inputs.artifact-pattern || format('{0}-*-extension-*', inputs.extension-name) }}
@@ -131,10 +168,13 @@ runs:
 
     - name: Sign extensions
       id: sign
+      if: inputs.mode == 'sign'
       shell: bash
       env:
         WORK_DIR: ${{ steps.setup.outputs.work-dir }}
         SOURCE_DIR: ${{ inputs.path != '' && inputs.path || format('{0}/artifacts', steps.setup.outputs.work-dir) }}
+        INPUT_SIGNING_KEY: ${{ inputs.signing-key }}
+        INPUT_ADDITIONAL_PUBLIC_KEYS: ${{ inputs.additional-public-keys }}
         INPUT_EXTENSION_NAME: ${{ inputs.extension-name }}
         INPUT_EXCLUDE_PLATFORMS: ${{ inputs.exclude-platforms }}
         INPUT_DUCKDB_VERSION: ${{ inputs.duckdb-version }}
@@ -144,15 +184,53 @@ runs:
         INPUT_PUBLISH_KEY_FILE: ${{ inputs.publish-key-file }}
       run: bash "$GITHUB_ACTION_PATH/scripts/sign.sh"
 
+    # .well-known is a hidden directory, and the objects are compressed already.
+    - name: Keep the signed tree for the next jobs
+      if: inputs.mode == 'sign'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.signed-artifact }}
+        path: ${{ steps.setup.outputs.work-dir }}/bundle
+        if-no-files-found: error
+        include-hidden-files: true
+        compression-level: 0
+        overwrite: true
+
+    - name: Download the signed tree
+      if: inputs.mode != 'sign'
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: ${{ inputs.signed-artifact }}
+        path: ${{ steps.setup.outputs.work-dir }}/bundle
+
+    - name: Check the signed tree
+      id: bundle
+      if: inputs.mode != 'sign'
+      shell: bash
+      env:
+        WORK_DIR: ${{ steps.setup.outputs.work-dir }}
+        INPUT_BUNDLE_DIGEST: ${{ inputs.bundle-digest }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/check-bundle.sh"
+
+    - name: Smoke test
+      id: smoke
+      if: inputs.mode == 'verify'
+      shell: bash
+      env:
+        WORK_DIR: ${{ steps.setup.outputs.work-dir }}
+        INPUT_SMOKE_TEST_SETUP_SQL: ${{ inputs.smoke-test-setup-sql }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/smoke-test.sh"
+
     - name: Install rclone
-      if: inputs.mode != 'sign-only'
+      if: inputs.mode == 'publish'
       shell: bash
       env:
         WORK_DIR: ${{ steps.setup.outputs.work-dir }}
       run: bash "$GITHUB_ACTION_PATH/scripts/install-rclone.sh"
 
     - name: Upload to the repository
-      if: inputs.mode != 'sign-only'
+      id: upload
+      if: inputs.mode == 'publish'
       shell: bash
       env:
         WORK_DIR: ${{ steps.setup.outputs.work-dir }}
@@ -165,10 +243,14 @@ runs:
         INPUT_S3_SECRET_ACCESS_KEY: ${{ inputs.s3-secret-access-key }}
         INPUT_S3_SESSION_TOKEN: ${{ inputs.s3-session-token }}
         INPUT_OVERWRITE_VERSIONED: ${{ inputs.overwrite-versioned }}
+        INPUT_ALLOW_KEY_CHANGE: ${{ inputs.allow-key-change }}
+        INPUT_ALLOW_DOWNGRADE: ${{ inputs.allow-downgrade }}
       run: bash "$GITHUB_ACTION_PATH/scripts/upload.sh"
 
-    - name: Smoke test
-      if: inputs.mode != 'sign-only' && inputs.smoke-test == 'true'
+    # Compares with 'false', because an empty input counts as the default in setup.sh.
+    - name: Check what the repository serves
+      id: check
+      if: inputs.mode == 'publish' && inputs.check-repository != 'false'
       shell: bash
       env:
         WORK_DIR: ${{ steps.setup.outputs.work-dir }}
@@ -176,15 +258,17 @@ runs:
         INPUT_S3_PREFIX: ${{ inputs.s3-prefix }}
         INPUT_S3_ENDPOINT: ${{ inputs.s3-endpoint }}
         INPUT_S3_REGION: ${{ inputs.s3-region }}
+        INPUT_S3_PROVIDER: ${{ inputs.s3-provider }}
         INPUT_S3_ACCESS_KEY_ID: ${{ inputs.s3-access-key-id }}
         INPUT_S3_SECRET_ACCESS_KEY: ${{ inputs.s3-secret-access-key }}
         INPUT_S3_SESSION_TOKEN: ${{ inputs.s3-session-token }}
         INPUT_REPOSITORY_URL: ${{ inputs.repository-url }}
-        INPUT_SMOKE_TEST_SETUP_SQL: ${{ inputs.smoke-test-setup-sql }}
-      run: bash "$GITHUB_ACTION_PATH/scripts/smoke-test.sh"
+      run: bash "$GITHUB_ACTION_PATH/scripts/check-repository.sh"
 
+    # Also runs after a failure, because a failed upload or check can leave objects live.
     - name: Write the summary
       id: summary
+      if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
       shell: bash
       env:
         WORK_DIR: ${{ steps.setup.outputs.work-dir }}
@@ -192,6 +276,9 @@ runs:
         INPUT_S3_BUCKET: ${{ inputs.s3-bucket }}
         INPUT_S3_PREFIX: ${{ inputs.s3-prefix }}
         INPUT_REPOSITORY_URL: ${{ inputs.repository-url }}
+        SMOKE_TEST_OUTCOME: ${{ steps.smoke.outcome }}
+        UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+        CHECK_OUTCOME: ${{ steps.check.outcome }}
       run: bash "$GITHUB_ACTION_PATH/scripts/summary.sh"
 
     - name: Remove the signing key

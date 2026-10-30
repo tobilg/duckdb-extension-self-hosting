@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # Covers .github/workflows and the action.yml in the root.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: /tests/wasm
+    schedule:
+      interval: weekly

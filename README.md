@@ -2,12 +2,15 @@
 
 A GitHub Action that signs DuckDB extensions with your own key and publishes them to a [custom extension repository](https://duckdb.org/docs/2.0/extensions/extension_repositories) on S3-compatible storage. Clients install them without `-unsigned`.
 
-It runs after DuckDB's standard build and does the rest in one step:
+It runs after DuckDB's standard build, in three jobs:
 
-- Finds the built binaries and checks their footers.
-- Signs each one and verifies the signature before anything leaves the runner.
-- Uploads them to the paths DuckDB requests, along with an optional key file.
-- Installs and loads the result with the real DuckDB CLI.
+| Job | Has | Does |
+| --- | --- | --- |
+| `mode: sign` | The signing key | Finds the built binaries, checks their footers, signs each one and verifies the signature. Never runs them. |
+| `mode: verify` | No secrets | Installs and loads the result with the real DuckDB CLI. Nothing has been uploaded yet, so a build that doesn't load stops here. |
+| `mode: publish` | The storage credentials | Uploads to the paths DuckDB requests, along with an optional key file, and reads everything back through your public URL. |
+
+The jobs are separate because `verify` runs your extension's native code, and a step can read every secret its job has. See [Security](#security).
 
 > **Status:** pre-release, and DuckDB's docs mark custom repositories as work in progress. It's tested against a local S3-compatible store (SeaweedFS). A release from a real extension to Cloudflare R2 is still open, and `v1` follows once that has passed.
 
@@ -27,20 +30,26 @@ Create a second key the same way and keep it offline. Pinning both from the star
 
 ### 2. Add the secrets
 
-| Secret | Value |
+| Secret or variable | Value |
 | --- | --- |
 | `EXTENSION_SIGNING_KEY` | Contents of `signing_key.pem` |
+| `EXTENSION_RESERVE_PUBLIC_KEY` | Contents of the second key's `.pub` file. A variable, because it's public. |
 | `S3_ENDPOINT` | Your store's S3 API, such as `https://<account_id>.r2.cloudflarestorage.com`. Leave out the input on AWS. |
-| `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | A token with read and write access to the bucket's objects |
+| `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | A token that can read, write and list the bucket's objects. On AWS, that's `s3:GetObject`, `s3:PutObject` and `s3:ListBucket`. |
 
-Prefer [environment secrets](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments) with required reviewers, so that the key is only available to the release job. On AWS, you can skip the static keys: role assumption through OIDC sets the `AWS_*` variables, and the action picks those up.
+Prefer [environment secrets](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments) with required reviewers, one environment for the key and another for the storage credentials, so that each is only available to the job that needs it. On AWS, you can skip the static keys: role assumption through OIDC sets the `AWS_*` variables, and the action picks those up.
 
 ### 3. Add the workflow
+
+Replace `<commit-sha>` with the commit of a release: the action handles your signing key.
 
 ```yaml
 on:
   push:
     tags: ['v*']
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -50,15 +59,49 @@ jobs:
       ci_tools_version: v2.0-cyanoptera
       extension_name: my_ext
 
-  publish:
+  sign:
     needs: build
     runs-on: ubuntu-24.04
-    environment: release
+    timeout-minutes: 30
+    environment: release-signing
+    outputs:
+      bundle-digest: ${{ steps.sign.outputs.bundle-digest }}
     steps:
-      - uses: tobilg/duckdb-extension-self-hosting@v1
+      - id: sign
+        uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
         with:
+          mode: sign
           extension-name: my_ext
           signing-key: ${{ secrets.EXTENSION_SIGNING_KEY }}
+          additional-public-keys: ${{ vars.EXTENSION_RESERVE_PUBLIC_KEY }}
+
+  verify:
+    needs: sign
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions: {}
+    steps:
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+        with:
+          mode: verify
+
+  publish:
+    needs: [sign, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release-storage
+    concurrency:
+      group: publish-my_ext
+      cancel-in-progress: false
+    steps:
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+        with:
+          mode: publish
+          bundle-digest: ${{ needs.sign.outputs.bundle-digest }}
           s3-endpoint: ${{ secrets.S3_ENDPOINT }}
           s3-bucket: my-extensions
           s3-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}
@@ -66,11 +109,11 @@ jobs:
           repository-url: https://extensions.example.com
 ```
 
-One Linux job publishes the binaries of every platform. [`examples/release.yml`](examples/release.yml) has a commented version.
+One Linux job signs and publishes the binaries of every platform. Each `verify` runner can only test its own platform, so list every type of runner you can. [`examples/release.yml`](examples/release.yml) has a commented version.
 
 ### 4. Install it
 
-Each client opts in and pins your key once per machine. The job summary of each run has this SQL filled in:
+Each client opts in and pins your key once per machine. The job summary of the publish job has this SQL filled in, with every key you list:
 
 ```sql
 SET allow_extension_repositories = 'allowed';
@@ -87,28 +130,48 @@ Later sessions only need `LOAD my_ext FROM my_repo;`. To upgrade, run `FORCE INS
 
 | Input | Default | Description |
 | --- | --- | --- |
-| `signing-key` | required | RSA-2048 private key in PEM format, not encrypted |
-| `extension-name` | | Extension to publish. Selects the artifacts, and skips other extensions found in them. |
+| `mode` | required | `sign`, `verify` or `publish`. `verify` refuses to share a job with the other two. |
+| `signed-artifact` | `duckdb-extension-signed` | Workflow artifact that takes the signed tree to the later jobs. Change it if a run signs more than once. |
+
+For `mode: sign`:
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `signing-key` | required | RSA-2048 private key in PEM format, not encrypted. No other mode accepts it. |
+| `extension-name` | | Extension to sign. Selects the artifacts, and skips other extensions found in them. Required unless `all-extensions` is set. |
+| `all-extensions` | `false` | Sign every extension found. Off by default, because a build tree holds more than the one being released. |
 | `artifact-pattern` | `<extension-name>-*-extension-*` | Glob for the workflow artifacts to download |
 | `path` | | Directory that already holds the binaries, for other build systems. Nothing is downloaded. |
-| `mode` | `publish` | `sign-only` stops after signing and leaves a repository tree in `signed-dir` |
-| `exclude-platforms` | | Comma or space separated platforms to skip |
-| `duckdb-version` | from the footer | DuckDB version directory, or a comma separated list. Only required for `C_STRUCT` builds. |
-| `extension-version` | from the footer | Version in the versioned path |
+| `exclude-platforms` | | Comma or space separated platforms to skip. Takes `*` and `?`, such as `wasm_*`. A name that can't be a platform fails the run, and an entry that matches nothing gets a warning. |
+| `duckdb-version` | from the footer | DuckDB version directory with its leading `v`, such as `v2.0.0`, or a comma separated list. Only required for `C_STRUCT` builds. |
+| `extension-version` | from the footer | Version in the versioned path. Also stands in for a footer without a usable version. `duckdb_extensions()` still reports the footer's version, so the run warns if they differ. |
 | `additional-public-keys` | | Further public keys for the key file, such as your reserve key |
-| `s3-bucket` | | Required in `publish` mode |
+| `upload-latest` | `true` | Include the path `INSTALL` reads |
+| `upload-versioned` | `true` | Include the path `INSTALL ... VERSION` reads |
+| `publish-key-file` | `true` | Include `.well-known/duckdb-extension-repo.json` |
+
+For `mode: verify`:
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `smoke-test-setup-sql` | | SQL to run first in the smoke test, such as loading an extension yours depends on |
+
+For `mode: publish`:
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `bundle-digest` | required | The output of the same name from the sign job. A signed tree that changed since is refused. |
+| `s3-bucket` | required | Bucket to publish to |
 | `s3-prefix` | | Key prefix inside the bucket |
-| `s3-endpoint` | AWS | S3 API endpoint. Must be `https://`. |
-| `s3-region` | `AWS_REGION`, or `auto` on R2 | Bucket region |
+| `s3-endpoint` | AWS | S3 API endpoint. Use `https://`: plain `http://` gets a warning, and rclone's AWS provider refuses to upload over it. |
+| `s3-region` | `auto` on R2, `AWS_REGION` elsewhere | Bucket region |
 | `s3-provider` | detected | [rclone provider](https://rclone.org/s3/) |
-| `s3-access-key-id`, `s3-secret-access-key`, `s3-session-token` | `AWS_*` variables | Credentials |
-| `upload-latest` | `true` | Upload to the path `INSTALL` reads |
-| `upload-versioned` | `true` | Upload to the path `INSTALL ... VERSION` reads |
+| `s3-access-key-id`, `s3-secret-access-key`, `s3-session-token` | `AWS_*` variables | Credentials. Set the key ID and secret together. Setting them ignores any `AWS_SESSION_TOKEN` in the environment. |
 | `overwrite-versioned` | `false` | Allow replacing a versioned object with different bytes |
-| `publish-key-file` | `true` | Publish `.well-known/duckdb-extension-repo.json` |
-| `smoke-test` | `true` | Install and load the result on this runner |
+| `allow-key-change` | `false` | Allow a signing key that isn't in the bucket's key file, for a [rotation](#rotating-keys) |
+| `allow-downgrade` | `false` | Allow moving the latest path to a lower version |
 | `repository-url` | `s3://<bucket>/<prefix>` | Public prefix clients use |
-| `smoke-test-setup-sql` | | SQL to run first in the smoke test, such as a custom CA file |
+| `check-repository` | `true` | Read every object back through `repository-url` and compare the bytes |
 
 ## Outputs
 
@@ -116,8 +179,10 @@ Later sessions only need `LOAD my_ext FROM my_repo;`. To upgrade, run `FORCE INS
 | --- | --- |
 | `fingerprint` | Fingerprint of the signing key, in the format DuckDB reports it |
 | `signed-dir` | Directory with the signed files, laid out like the repository |
-| `files` | JSON array with platform, versions, ABI, object path and SHA-256 of each file |
-| `repository-url` | Prefix for `CREATE EXTENSION REPOSITORY`. Empty in `sign-only` mode. |
+| `bundle-digest` | Digest of the signed tree, for the publish job. Set by the sign job. |
+| `files` | JSON array with platform, versions, ABI and object path of each file, the SHA-256 of the object (`sha256`) and of the binary inside it (`binary_sha256`) |
+| `uploaded-objects` | JSON array of the object paths this run uploaded or confirmed. Shorter than `files` if an upload failed partway. Set by the publish job. |
+| `repository-url` | Prefix for `CREATE EXTENSION REPOSITORY`. Set by the publish job. |
 
 ## What ends up in the bucket
 
@@ -128,12 +193,28 @@ Later sessions only need `LOAD my_ext FROM my_repo;`. To upgrade, run `FORCE INS
 <duckdb_version>/wasm_<target>/<name>.duckdb_extension.wasm
 ```
 
-Platform and versions come from the footer of each binary, not from the artifact name, so any build system works.
+Platform and versions come from the footer of each binary, not from the artifact name, so any build system works. The file name gives the extension's name, which can only have lowercase letters, digits and underscores, and can't start with a digit. DuckDB lowercases the name when it requests the file, and looks up C symbols named after it to load the extension.
 
 A new DuckDB release means new objects, depending on the ABI type:
 
 - **`CPP` and `C_STRUCT_UNSTABLE`** builds only load in the exact DuckDB version they were built for, so rebuild them for each release.
 - **`C_STRUCT`** builds against the stable C API can be loaded by later versions. List every version in `duckdb-version`, and the same signed binary is published to each directory.
+
+## What stops a release
+
+Each of these fails the run before anything is uploaded:
+
+- **A build that doesn't load.** The verify jobs run first, and `publish` has `needs` on them. A failure there leaves the bucket as it was, so `latest` keeps working and the version number stays free for a fixed build.
+- **A signed tree that changed.** `bundle-digest` comes from the sign job through GitHub's job outputs, which the verify job can't touch.
+- **A signing key clients don't know.** If the bucket has a key file and doesn't list the signing key, clients that pinned those keys would reject the release. This catches a wrong secret. A rotation sets `allow-key-change`.
+- **A lower version on the latest path.** This catches an older tag re-run after a newer one. It compares major.minor.patch with what's live, and only leaves a notice if a version isn't in that form, like a commit hash. Deliberate rollbacks set `allow-downgrade`.
+- **Different bytes for a published version.** Rebuilding produces different bytes, so re-running a release with new builds hits this. Re-running only the failed job is safe, because it uses the same signed tree. So is signing the same build again, which gives the same bytes.
+
+After the upload, the publish job reads every object and the key file back through `repository-url`, for all platforms. A failure there means a wrong URL or a CDN serving an older object. These objects are already live at that point, and the job summary says so.
+
+If the upload itself fails partway, the summary and `uploaded-objects` list what went live. Re-run the job to finish it.
+
+Two publish jobs at the same time can still get past the version check, because it isn't atomic on S3. That's why the workflow above has a `concurrency` group: use one for every extension.
 
 ## Serving the bucket
 
@@ -143,17 +224,21 @@ Clients only send `HEAD` and `GET`, so a public bucket can be served from any HT
 | --- | --- | --- |
 | `https://extensions.example.com` | Public | httpfs, which DuckDB autoinstalls from its core repository |
 | `s3://my-bucket` | Private | httpfs, plus a `CREATE SECRET (TYPE s3, ...)` for `INSTALL` |
-| `http://extensions.example.com` | Public | Nothing extra, but DuckDB doesn't follow redirects here, so an HTTP-to-HTTPS redirect breaks it |
+| `http://extensions.example.com` | Public | Nothing extra with an inline key, but only until something loads httpfs: from then on DuckDB requests `https://` instead. DuckDB also doesn't follow redirects here, so an HTTP-to-HTTPS redirect breaks it. |
 
 On Cloudflare R2, use a custom domain. Cloudflare says public access through `r2.dev` ["is rate-limited and should only be used for development purposes"](https://developers.cloudflare.com/r2/buckets/public-buckets/).
+
+Custom domains go through Cloudflare's cache, which [keeps `.gz` files for 2 hours by default](https://developers.cloudflare.com/cache/concepts/default-cache-behavior/). The latest paths keep their names between releases, so the action stores `Cache-Control: no-cache` on them and on the key file, and `public, max-age=86400` on versioned objects. A Cache Rule of your own can override that. If a client could still get an old copy, the check after the upload fails with a "different build" error, and you can purge the path. After `overwrite-versioned`, purge the versioned path too.
 
 ## Security
 
 - **Pin the action by commit.** It handles your signing key: `uses: tobilg/duckdb-extension-self-hosting@<sha> # v1.0.0`.
 - **Limit who can reach the key.** Use an environment with required reviewers, and only run the job on tags.
-- **What the action does with the key.** It goes through one step's environment into a `0600` file, which is removed afterwards even if the run fails. It's never passed to rclone, and tracing is never turned on.
-- **What it downloads.** rclone is pinned and checked against hashes stored in this repository. No `curl | bash`.
-- **Published versions don't change.** Replacing a versioned object with different bytes fails unless you set `overwrite-versioned`. Re-running a release is safe, because the same input gives the same bytes.
+- **Why three jobs.** The runner keeps a job's secrets in its own memory for the whole job, and code running in that job can read them there, as the [tj-actions compromise](https://www.cve.org/CVERecord?id=CVE-2025-30066) did. A clean environment for the DuckDB CLI doesn't change that, so a build that's compromised upstream could steal a signing key from any job that loads it, and a key can't be revoked. So `verify` refuses to run in a job that signed or published, and refuses the key, S3 credentials and `AWS_*` credentials in its job. It can't see other secrets you add to that job, so don't.
+- **What the action does with the key.** It goes through the signing step's environment into a `0600` file, after the artifacts are downloaded. The file is deleted as soon as the last binary is signed, before compressing, and a final step removes it if the run was killed before that. It's never passed to rclone, and tracing is never turned on.
+- **What the verify job can reach.** It runs your extension's native code with only `PATH`, `HOME`, `TMPDIR`, and the proxy and CA variables in the CLI's environment. Set `permissions: {}` on it, because it needs no `GITHUB_TOKEN`. It can reach the workflow run's artifacts, but anything it changes fails the `bundle-digest` check, and it can't sign anything.
+- **What it downloads.** rclone is pinned and checked against hashes stored in this repository. The verify job gets the DuckDB CLI for each published version from DuckDB's GitHub releases, over HTTPS only and without a hash check, because the version comes from your build. No `curl | bash`.
+- **Published versions don't change.** Replacing a versioned object with different bytes fails unless you set `overwrite-versioned`.
 
 What signing can't do, whichever tool you use:
 
@@ -167,7 +252,7 @@ What signing can't do, whichever tool you use:
 Keys only change when a client creates the repository again:
 
 1. On each client, pin both keys with `CREATE OR REPLACE EXTENSION REPOSITORY ... USING PUBLIC KEYS '<old>', '<new>'`. Skip this if you pinned your reserve key from the start.
-2. Publish with the new `signing-key`. List the old public key in `additional-public-keys`, and set `overwrite-versioned: true` if you re-sign an existing version.
+2. Publish with the new `signing-key`, and list the old public key in `additional-public-keys` on the sign job. Set `allow-key-change: true` on the publish job, unless the new key is already in the bucket's key file as your reserve key. Set `overwrite-versioned: true` too if you re-sign an existing version.
 3. On each client, run `FORCE INSTALL` for the installed extensions.
 4. On each client, remove the old key with another `CREATE OR REPLACE`.
 
@@ -180,7 +265,7 @@ Removing a key makes builds signed with it fail on the next `LOAD`, so finish st
 The tests load the action's output in headless Chrome with DuckDB-Wasm `1.33.1-dev110.0`. That covers `C_STRUCT` and `CPP` builds, and rejection of wrong keys, tampered files, bare `LOAD`, `custom_extension_repository` and direct URLs. Three things are different from native DuckDB:
 
 - **No stable release yet.** The tested build is a dev build of the v2.0.0 commit, so it requests `<prefix>/d54cbbe3df/wasm_eh/...` rather than `v2.0.0/`. A stable DuckDB-Wasm 2.0 should request `v2.0.0/`, where DuckDB's own repository serves these files today. To test against the dev build now, set `duckdb-version: d54cbbe3df`.
-- **The bucket needs CORS** that allows `GET` from your site's origin, or the fetch fails. The smoke test can't cover Wasm, so check this yourself.
+- **The bucket needs CORS** that allows `GET` from your site's origin, or the fetch fails. The verify job can't cover Wasm, so check this yourself.
 - **The key must be inline.** Fetching the key file needs httpfs, which the tested build can't load.
 
 There are two client setups. Use the first unless you need DuckDB's home directory in OPFS, for example for persistent secrets:
@@ -213,9 +298,12 @@ The Node.js bindings of DuckDB-Wasm can't use custom repositories at the moment:
 bash tests/unit.sh        # no network, no Docker
 bash tests/e2e.sh         # SeaweedFS in Docker, real extensions, real DuckDB CLI
 bash tests/wasm/run.sh    # DuckDB-Wasm in headless Chrome, needs Node.js
+bash tests/rclone-pin.sh  # checks the rclone pin, or moves it: bash tests/rclone-pin.sh v1.76.0
 ```
 
-Scripts must keep running on bash 3.2, the stock bash on macOS. `duckdb`, `duckdb-web` and `duckdb-wasm` are submodules for reference only: GitHub doesn't fetch them when running the action, and nothing here reads them at runtime.
+Scripts must keep running on bash 3.2, the stock bash on macOS. The behavior this action relies on is in [DuckDB](https://github.com/duckdb/duckdb)'s `extension_repository_manager.cpp` and `extension_install_dynamic.cpp`, [`duckdb-web`](https://github.com/duckdb/duckdb-web)'s `extension_repositories.md`, and [`duckdb-wasm`](https://github.com/duckdb/duckdb-wasm).
+
+The tests download real extensions and check them against `tests/fixtures.sha256`. A hash mismatch means that the file changed on DuckDB's servers, not that this project broke. Dependabot keeps the pinned actions and the Wasm test's packages up to date.
 
 ## License
 
