@@ -346,15 +346,15 @@ jobs:
           make_extension artifacts/linux/demo.duckdb_extension linux_amd64 v2.0.0 v1.0.0 CPP 3000000
           make_extension artifacts/mac/demo.duckdb_extension osx_arm64 v2.0.0 v1.0.0 CPP 3000000
           make_extension artifacts/other/other.duckdb_extension linux_amd64 v2.0.0 v1.0.0 CPP 3000
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: demo-v2.0.0-extension-linux_amd64
           path: artifacts/linux
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: demo-v2.0.0-extension-osx_arm64
           path: artifacts/mac
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: other-v2.0.0-extension-linux_amd64
           path: artifacts/other
