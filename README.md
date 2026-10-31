@@ -26,7 +26,7 @@ openssl pkey -pubin -in signing_key.pub -outform DER | openssl dgst -sha256
 
 The last line prints the key's fingerprint. Publish it somewhere other than the bucket, so that clients can check it.
 
-Create a second key the same way and keep it offline. Pinning both from the start makes [rotation](#rotating-keys) much easier.
+Create a second key the same way, publish its fingerprint too, and keep the key offline. Pinning both from the start makes [rotation](#rotating-keys) much easier.
 
 ### 2. Add the secrets
 
@@ -126,15 +126,24 @@ A platform that nothing tests is still signed and published, so test it yourself
 
 ### 4. Install it
 
-Each client opts in and pins your key once per machine. The job summary of the publish job has this SQL filled in, with every key you list:
+Each client opts in and pins your keys once per machine:
 
 ```sql
 SET allow_extension_repositories = 'allowed';
 CREATE EXTENSION REPOSITORY IF NOT EXISTS my_repo
-    WITH PREFIX 'https://extensions.example.com'
-    USING PUBLIC KEY '-----BEGIN PUBLIC KEY----- ...';
+    WITH PREFIX 'https://extensions.example.com';
 INSTALL my_ext FROM my_repo;
 LOAD my_ext FROM my_repo;
+```
+
+`CREATE` reads the keys from your bucket's key file, pins them and never fetches them again. It prints each one as `sha256:<hex>`, so compare those with the [fingerprints you published](#1-create-a-signing-key). That comparison is what catches a swapped key file: whoever can write to your bucket when a new client runs `CREATE` can get their own key pinned, and that client would then load their builds. Clients that pinned earlier aren't affected.
+
+Clients can pass the key inline instead, which needs no comparison, because a build signed with another key is refused. [DuckDB-Wasm](#duckdb-wasm) needs this form. The job summary of the publish job has it filled in, with every key you list:
+
+```sql
+CREATE EXTENSION REPOSITORY IF NOT EXISTS my_repo
+    WITH PREFIX 'https://extensions.example.com'
+    USING PUBLIC KEY '-----BEGIN PUBLIC KEY----- ...';
 ```
 
 Later sessions only need `LOAD my_ext FROM my_repo;`. To upgrade, run `FORCE INSTALL my_ext FROM my_repo;` after the opt-in, because `UPDATE EXTENSIONS` skips these extensions. Autoloading and a bare `LOAD my_ext` don't work either: DuckDB only uses your key when you name the repository. The [DuckDB docs](https://duckdb.org/docs/2.0/extensions/extension_repositories#using-a-repository) have the details.
@@ -161,7 +170,7 @@ For `mode: sign`:
 | `additional-public-keys` | | Further public keys for the key file, such as your reserve key |
 | `upload-latest` | `true` | Include the path `INSTALL` reads |
 | `upload-versioned` | `true` | Include the path `INSTALL ... VERSION` reads |
-| `publish-key-file` | `true` | Include `.well-known/duckdb-extension-repo.json` |
+| `publish-key-file` | `true` | Include `.well-known/duckdb-extension-repo.json`, which `CREATE` reads when a client [doesn't pass a key](#4-install-it) |
 
 For `mode: verify`:
 
@@ -321,7 +330,7 @@ publish:
 
 ## Serving the bucket
 
-Clients only send `HEAD` and `GET`, so a public bucket can be served from any HTTPS endpoint. Clients reject anything not signed by a key they pinned, so the bucket doesn't have to be trusted.
+Clients only send `HEAD` and `GET`, so a public bucket can be served from any HTTPS endpoint. Clients reject anything not signed by a key they pinned, so the bucket doesn't have to be trusted after that. The exception is pinning itself: a first `CREATE` without a key trusts the key file, unless the client [compares the fingerprints or passes the key inline](#4-install-it).
 
 | Prefix | Bucket | Clients need |
 | --- | --- | --- |
@@ -345,7 +354,7 @@ Custom domains go through Cloudflare's cache, which [keeps `.gz` files for 2 hou
 
 What signing can't do, whichever tool you use:
 
-- **Trust on first use.** Without `USING PUBLIC KEY`, clients trust whoever can write to the key file at that moment. Pass the key inline, or publish the fingerprint elsewhere.
+- **Trust on first use.** Without `USING PUBLIC KEY`, clients trust whoever can write to the key file at that moment. Pass the key inline, or publish the fingerprint elsewhere and [have clients compare it](#4-install-it).
 - **No revocation or expiry.** A leaked key stays trusted until each client replaces its pin.
 - **No rollback protection.** Signatures carry no timestamp, so anyone who can write to the bucket can serve an older, validly signed build.
 - **No sandbox.** Extensions are native code with the privileges of the DuckDB process.

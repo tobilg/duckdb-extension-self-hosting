@@ -154,6 +154,7 @@ SELECT name FROM rusty_quack(['Jane']);"; then
 else
 	fail 'a client using the key file installs and loads it' "$(tail -n 3 "$CLIENT_LOG")"
 fi
+check_contains 'and CREATE prints the fingerprint to compare' "$CLIENT_LOG" "$(output_value fingerprint)"
 if client wrongkey "$SETUP_SQL
 SET allow_extension_repositories = 'allowed';
 CREATE EXTENSION REPOSITORY my_repo WITH PREFIX '$PUBLIC' USING PUBLIC KEY '$(cat "$RUNS_DIR/keys/two.pub")';
