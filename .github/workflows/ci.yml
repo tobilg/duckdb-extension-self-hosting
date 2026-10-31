@@ -76,6 +76,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       bundle-digest: ${{ steps.sign.outputs.bundle-digest }}
+      verify-runners: ${{ steps.sign.outputs.verify-runners }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Create a test key and fetch real extensions
@@ -90,13 +91,15 @@ jobs:
           fetch_fixture community v2.0.0/linux_amd64/rusty_quack.duckdb_extension "$RUNNER_TEMP/binaries/linux/rusty_quack.duckdb_extension"
           fetch_fixture community v2.0.0/linux_arm64/rusty_quack.duckdb_extension "$RUNNER_TEMP/binaries/linux-arm/rusty_quack.duckdb_extension"
           fetch_fixture community v2.0.0/osx_arm64/rusty_quack.duckdb_extension "$RUNNER_TEMP/binaries/mac/rusty_quack.duckdb_extension"
+          # Community extensions have no Intel builds, so this is the only way to load a real one on that runner.
+          fetch_fixture core v2.0.0/osx_amd64/inet.duckdb_extension "$RUNNER_TEMP/binaries/intel/inet.duckdb_extension"
 
       - name: Sign
         id: sign
         uses: ./
         with:
           mode: sign
-          extension-name: rusty_quack
+          all-extensions: 'true'
           path: ${{ runner.temp }}/binaries
           signing-key: ${{ env.TEST_SIGNING_KEY }}
           signed-artifact: ci-signed
@@ -107,14 +110,16 @@ jobs:
           SIGNED_DIR: ${{ steps.sign.outputs.signed-dir }}
           FILES: ${{ steps.sign.outputs.files }}
           DIGEST: ${{ steps.sign.outputs.bundle-digest }}
+          RUNNERS: ${{ steps.sign.outputs.verify-runners }}
         run: |
           set -x
           [[ "$FINGERPRINT" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$DIGEST" =~ ^[0-9a-f]{64}$ ]]
           test -f "$SIGNED_DIR/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz"
           test -f "$SIGNED_DIR/.well-known/duckdb-extension-repo.json"
-          test "$(jq 'length' <<<"$FILES")" = 6
-          test "$(jq -r '.[0].name' <<<"$FILES")" = rusty_quack
+          test "$(jq 'length' <<<"$FILES")" = 8
+          test "$(jq -r '[.[].name] | unique | join(",")' <<<"$FILES")" = inet,rusty_quack
+          test "$RUNNERS" = '["macos-26","macos-26-intel","ubuntu-24.04","ubuntu-24.04-arm"]'
 
       - name: An empty signing key fails
         id: empty-key
@@ -136,7 +141,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]
+        os: ${{ fromJSON(needs.action-sign.outputs.verify-runners) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -173,7 +178,7 @@ jobs:
         run: |
           set -x
           test "$OUTCOME" = failure
-          test "$(jq 'length' <<<"$FILES")" = 6
+          test "$(jq 'length' <<<"$FILES")" = 8
 
   action-publish:
     name: Run the publish job through uses
@@ -210,8 +215,8 @@ jobs:
           set -x
           [[ "$FINGERPRINT" =~ ^sha256:[0-9a-f]{64}$ ]]
           test "$REPOSITORY_URL" = "$S3_ENDPOINT/public-bucket/repo"
-          test "$(jq 'length' <<<"$FILES")" = 6
-          test "$(jq 'length' <<<"$UPLOADED")" = 7
+          test "$(jq 'length' <<<"$FILES")" = 8
+          test "$(jq 'length' <<<"$UPLOADED")" = 9
           curl -fsS -o /dev/null "$REPOSITORY_URL/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz"
           curl -fsS -o /dev/null "$REPOSITORY_URL/.well-known/duckdb-extension-repo.json"
 
@@ -277,7 +282,7 @@ jobs:
           UPLOADED: ${{ steps.publish-role.outputs.uploaded-objects }}
         run: |
           set -x
-          test "$(jq 'length' <<<"$UPLOADED")" = 7
+          test "$(jq 'length' <<<"$UPLOADED")" = 9
 
   action-oidc-guard:
     name: Refuse to run native code in a job that can request an OIDC token
@@ -335,6 +340,28 @@ jobs:
       - name: Check that it failed
         if: steps.same-job.outcome != 'failure'
         run: exit 1
+
+  # The README's quick start relies on this: without a tag 'sign' is skipped, and 'verify' must be skipped with it, although its
+  # matrix comes from an output that doesn't exist then. If GitHub evaluated the matrix anyway, the run would fail here.
+  no-tag-sign:
+    name: Skip signing on a build without a tag
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    outputs:
+      verify-runners: ${{ steps.runners.outputs.verify-runners }}
+    steps:
+      - id: runners
+        run: exit 1
+
+  no-tag-verify:
+    name: Skip verifying with it
+    needs: no-tag-sign
+    strategy:
+      matrix:
+        os: ${{ fromJSON(needs.no-tag-sign.outputs.verify-runners) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: exit 1
 
   make-artifacts:
     name: Build fake artifacts

@@ -23,6 +23,13 @@ print_table() {
 	jq -s -r 'sort_by(.name, .duckdb_version, .platform, .channel) | .[] | "| \(.name) | \(.platform) | \(.abi) | \(.duckdb_version) | \(.extension_version) | `\(.object)` |"' "$manifest"
 }
 
+print_without_runner() {
+	local platforms
+	platforms=$(platforms_without_runner "$manifest")
+	[ -n "$platforms" ] || return 0
+	printf '\nNo runner can load these builds, so the verify job does not test them: %s. See "Choosing platforms" in the README.\n' "$platforms"
+}
+
 # The SQL pins every key, so that clients can follow a rotation to the reserve key without creating the repository again.
 print_client_sql() { # <repository url>
 	local keys_sql="" key_count=0 using name
@@ -56,6 +63,7 @@ sign)
 	{
 		printf '## Signed DuckDB extensions\n\n'
 		print_table
+		print_without_runner
 	} >>"$summary"
 	;;
 verify)
@@ -94,6 +102,7 @@ publish)
 				printf '> **The repository check failed**, and these objects are already live. See the log of this run.\n\n'
 			fi
 			print_table
+			print_without_runner
 			print_client_sql "$url"
 		fi
 	} >>"$summary"

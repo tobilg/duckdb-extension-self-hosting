@@ -64,6 +64,21 @@ check_credentials() {
 	die "No S3 credentials found. Set 's3-access-key-id' and 's3-secret-access-key', or assume a role in an earlier step. $KEY_HINT"
 }
 
+# Otherwise a typo in a platform or a label would only show up when the verify job can't find a runner, or not at all.
+check_runner_labels() { # <JSON object>
+	local problem
+	problem=$(printf '%s' "$1" | jq -s -r --argjson runners "$VERIFY_RUNNERS" '
+		if length != 1 or (.[0] | type) != "object" then "it must be one JSON object"
+		else
+			[.[0] | to_entries[] |
+				if $runners[.key] == null then "no runner can load \(.key)"
+				elif (.value | type) != "string" or (.value | test("^[A-Za-z0-9][A-Za-z0-9._-]*$") | not) then "\(.key) needs a single runner label"
+				else empty end] | first // ""
+		end
+	' 2>/dev/null) || die "Input 'verify-runner-labels' isn't valid JSON."
+	[ -z "$problem" ] || die "Input 'verify-runner-labels' doesn't work: $problem. Example: {\"osx_arm64\": \"my-mac-runner\"}"
+}
+
 case "$mode" in
 sign)
 	if ! is_true "${HAS_SIGNING_KEY:-false}"; then
@@ -123,6 +138,9 @@ publish)
 	;;
 esac
 require_tool jq
+if [ "$mode" = "sign" ] && [ -n "${INPUT_VERIFY_RUNNER_LABELS:-}" ]; then
+	check_runner_labels "$INPUT_VERIFY_RUNNER_LABELS"
+fi
 
 umask 077
 work_dir=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/duckdb-extension-publisher.XXXXXX")

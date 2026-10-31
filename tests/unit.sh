@@ -914,6 +914,62 @@ run_step summary.sh WORK_DIR="$MANY_WORK" INPUT_S3_BUCKET=bucket INPUT_MODE=publ
 check_contains 'the SQL covers the first extension' "$RUN_SUMMARY" 'INSTALL "alpha" FROM my_repo'
 check_contains 'and the others' "$RUN_SUMMARY" 'LOAD "beta" FROM my_repo'
 
+echo; echo '--- verify runners'
+runners_for() { # <JSON object of labels, or empty> <platform...>
+	local labels=$1 platform
+	shift
+	for platform in "$@"; do printf '{"platform":"%s"}\n' "$platform"; done >"$RUNS_DIR/platforms.jsonl"
+	lib_call 'verify_runners "$1" "$2"' "$RUNS_DIR/platforms.jsonl" "$labels"
+}
+without_runner() { # <platform...>
+	local platform
+	for platform in "$@"; do printf '{"platform":"%s"}\n' "$platform"; done >"$RUNS_DIR/platforms.jsonl"
+	lib_call 'platforms_without_runner "$1"' "$RUNS_DIR/platforms.jsonl"
+}
+check_equal 'one runner for each platform that has one' '["macos-26","macos-26-intel","ubuntu-24.04","ubuntu-24.04-arm"]' "$(runners_for '' osx_arm64 linux_arm64 linux_amd64 osx_amd64 windows_amd64 wasm_eh linux_amd64_musl)"
+check_equal 'and only for what was built' '["ubuntu-24.04-arm"]' "$(runners_for '' linux_arm64)"
+check_equal 'each runner once, though a platform has several objects' '["macos-26"]' "$(runners_for '' osx_arm64 osx_arm64 osx_arm64)"
+check_equal 'Apple Silicon does not get the Intel runner' '["macos-26"]' "$(runners_for '' osx_arm64)"
+check_equal 'Intel does not get the Apple Silicon runner' '["macos-26-intel"]' "$(runners_for '' osx_amd64)"
+check_equal 'a musl build does not get the glibc runner' '["ubuntu-24.04"]' "$(runners_for '' linux_amd64_musl)"
+check_equal 'a Wasm-only release still has a runner, because an empty matrix fails the job' '["ubuntu-24.04"]' "$(runners_for '' wasm_eh wasm_mvp)"
+check_equal 'a label replaces the default' '["my-mac-runner","ubuntu-24.04"]' "$(runners_for '{"osx_arm64":"my-mac-runner"}' osx_arm64 linux_amd64)"
+check_equal 'a label for a platform that was not built adds nothing' '["ubuntu-24.04"]' "$(runners_for '{"osx_arm64":"my-mac-runner"}' linux_amd64)"
+check_equal 'two platforms on one label share a job' '["both"]' "$(runners_for '{"linux_amd64":"both","linux_arm64":"both"}' linux_amd64 linux_arm64)"
+check_equal 'the fallback takes the label too' '["my-runner"]' "$(runners_for '{"linux_amd64":"my-runner"}' windows_amd64)"
+check_equal 'lists the platforms without a runner' 'linux_amd64_musl, wasm_eh, windows_amd64' "$(without_runner windows_amd64 linux_amd64 wasm_eh linux_amd64_musl osx_arm64 wasm_eh)"
+check_equal 'and nothing if all have one' '' "$(without_runner linux_amd64 linux_arm64 osx_amd64 osx_arm64)"
+
+R="$RUNS_DIR/runners"
+for platform in linux_amd64 linux_arm64 osx_arm64 windows_amd64 linux_amd64_musl; do
+	make_extension "$R/$platform/demo.duckdb_extension" "$platform" v2.0.0 v1 CPP 2000
+done
+sign_only runners "$R"
+check_equal 'the sign job sets verify-runners from the footers' '["macos-26","ubuntu-24.04","ubuntu-24.04-arm"]' "$(output_value verify-runners)"
+check_contains 'its summary names the builds no runner can load' "$RUN_SUMMARY" 'does not test them: linux_amd64_musl, windows_amd64.'
+RUNNERS_WORK=$(output_value work-dir)
+new_step_run runners_publish
+run_step summary.sh WORK_DIR="$RUNNERS_WORK" INPUT_S3_BUCKET=bucket INPUT_MODE=publish
+check_contains 'and so does the summary of the publish job' "$RUN_SUMMARY" 'does not test them: linux_amd64_musl, windows_amd64.'
+new_step_run runners_failed_upload
+run_step summary.sh WORK_DIR="$RUNNERS_WORK" INPUT_S3_BUCKET=bucket INPUT_MODE=publish UPLOAD_OUTCOME=failure
+check_not_contains 'but not after a failed upload, which has more urgent news' "$RUN_SUMMARY" 'does not test them'
+sign_only runners_excluded "$R" INPUT_EXCLUDE_PLATFORMS='osx_* linux_arm64'
+check_equal 'verify-runners follows exclude-platforms' '["ubuntu-24.04"]' "$(output_value verify-runners)"
+sign_only runners_labels "$R" INPUT_VERIFY_RUNNER_LABELS='{"osx_arm64":"my-mac-runner"}'
+check_equal 'and takes verify-runner-labels' '["my-mac-runner","ubuntu-24.04","ubuntu-24.04-arm"]' "$(output_value verify-runners)"
+sign_only runners_no_labels "$R" INPUT_VERIFY_RUNNER_LABELS='{}'
+check_equal 'an empty object changes nothing' '["macos-26","ubuntu-24.04","ubuntu-24.04-arm"]' "$(output_value verify-runners)"
+check_refused 'refuses labels that are not JSON' "isn't valid JSON" sign_only labels_text "$R" INPUT_VERIFY_RUNNER_LABELS='macos-27'
+check_refused 'or not an object' 'it must be one JSON object' sign_only labels_array "$R" INPUT_VERIFY_RUNNER_LABELS='["macos-27"]'
+check_refused 'or more than one' 'it must be one JSON object' sign_only labels_two "$R" INPUT_VERIFY_RUNNER_LABELS='{} {}'
+check_refused 'refuses a platform that no runner can load' 'no runner can load windows_amd64' sign_only labels_windows "$R" INPUT_VERIFY_RUNNER_LABELS='{"windows_amd64":"windows-2025"}'
+check_refused 'or a typo' 'no runner can load osx_arm' sign_only labels_typo "$R" INPUT_VERIFY_RUNNER_LABELS='{"osx_arm":"macos-27"}'
+check_refused 'refuses a list of labels' 'osx_arm64 needs a single runner label' sign_only labels_list "$R" INPUT_VERIFY_RUNNER_LABELS='{"osx_arm64":["self-hosted"]}'
+check_refused 'an empty label' 'osx_arm64 needs a single runner label' sign_only labels_empty "$R" INPUT_VERIFY_RUNNER_LABELS='{"osx_arm64":""}'
+check_refused 'or one that is not a label' 'osx_arm64 needs a single runner label' sign_only labels_space "$R" INPUT_VERIFY_RUNNER_LABELS='{"osx_arm64":"a b"}'
+check_contains 'action.yml passes the output on' "$TESTS_ROOT/action.yml" 'value: ${{ steps.sign.outputs.verify-runners }}'
+
 echo; echo '--- action.yml wiring'
 # Each script must get every INPUT_* it reads from its own step in action.yml.
 awk '
@@ -1000,13 +1056,40 @@ check_equal 'the role check only grants id-token to the publish job' 'publish ' 
 AWS_ACTION_PIN=$(grep -oE 'aws-actions/configure-aws-credentials@[0-9a-f]{40}' "$OIDC_EXAMPLE" | sort -u)
 check 'the OIDC example pins the AWS action by commit' test -n "$AWS_ACTION_PIN"
 check_equal 'and the README pins the same commit' "$AWS_ACTION_PIN" "$(grep -oE 'aws-actions/configure-aws-credentials@[0-9a-f]{40}' "$TESTS_ROOT/README.md" | sort -u)"
-VERIFY_RUNNERS='os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]'
-check_contains 'CI runs the verify job on the runners the examples list' "$TESTS_ROOT/.github/workflows/ci.yml" "$VERIFY_RUNNERS"
+QUICK_START="$RUNS_DIR/quick-start.md"
+sed -n '/^## Quick start/,/^## Full setup/p' "$TESTS_ROOT/README.md" >"$QUICK_START"
+check_contains 'the README has a quick start' "$QUICK_START" '### 1. Create a key and a bucket'
+check_contains 'and a full setup after it' "$QUICK_START" '## Full setup'
+check_not_contains 'the quick start needs no environments' "$QUICK_START" 'environment:'
+check_contains 'and only signs on tags' "$QUICK_START" "if: startsWith(github.ref, 'refs/tags/')"
+check_contains 'and adds a tag trigger' "$QUICK_START" "tags: ['*']"
+check_contains 'but says not to add it to a push without filters' "$QUICK_START" 'If `push` has no filters, it already runs on tags, so leave it'
+check_contains 'and passes the digest to the publish job' "$QUICK_START" 'bundle-digest: ${{ needs.sign.outputs.bundle-digest }}'
+check_contains 'and takes the verify runners from the sign job' "$QUICK_START" 'os: ${{ fromJSON(needs.sign.outputs.verify-runners) }}'
+check_contains 'and passes them on from the sign step' "$QUICK_START" 'verify-runners: ${{ steps.sign.outputs.verify-runners }}'
+check_contains 'and gives the verify job no token' "$QUICK_START" 'permissions: {}'
+check_contains 'and publishes one release at a time' "$QUICK_START" 'cancel-in-progress: false'
+unset_secrets=
+while read -r secret; do
+	grep -q "gh secret set $secret " "$QUICK_START" || unset_secrets="$unset_secrets $secret"
+done <<EOF
+$(grep -oE 'secrets\.[A-Z0-9_]+' "$QUICK_START" | sed 's/secrets\.//' | sort -u)
+EOF
+check_equal 'and sets every secret its jobs read' '' "$unset_secrets"
+check_contains 'CI checks that verify is skipped with sign, which the quick start relies on' "$TESTS_ROOT/.github/workflows/ci.yml" 'os: ${{ fromJSON(needs.no-tag-sign.outputs.verify-runners) }}'
+check_contains 'CI takes the verify runners from the sign job, so a real run proves it' "$TESTS_ROOT/.github/workflows/ci.yml" 'os: ${{ fromJSON(needs.action-sign.outputs.verify-runners) }}'
+RUNNER_MAP=$(lib_call 'printf "%s" "$VERIFY_RUNNERS"' | jq -r 'to_entries[] | "\(.key) \(.value)"')
+while read -r platform runner; do
+	check_equal "the README names the runner for $platform" 1 "$(grep -cE "^\| \`$platform\`.*\| \`$runner\` \|$" "$TESTS_ROOT/README.md")"
+done <<EOF
+$RUNNER_MAP
+EOF
 for example in "$TESTS_ROOT/examples/release.yml" "$OIDC_EXAMPLE" "$TESTS_ROOT/README.md"; do
 	name=$(basename "$example")
-	check_contains "$name tests every platform built by default that has a runner" "$example" "$VERIFY_RUNNERS"
-	check_contains "$name says how to add Intel Macs" "$example" 'opt_in_archs: osx_amd64'
-	check_contains "$name names the Intel runner" "$example" 'macos-26-intel'
+	check_contains "$name takes the verify runners from the sign job" "$example" 'os: ${{ fromJSON(needs.sign.outputs.verify-runners) }}'
+	check_contains "$name passes them on from the sign step" "$example" 'verify-runners: ${{ steps.sign.outputs.verify-runners }}'
+	check_contains "$name says how to choose platforms" "$example" 'opt_in_archs'
+	check_not_contains "$name does not list runners by hand" "$example" 'os: ['
 	check_contains "$name sets a concurrency group for publishing" "$example" 'cancel-in-progress: false'
 	check_contains "$name sets a timeout" "$example" 'timeout-minutes:'
 	check_contains "$name passes the digest to the publish job" "$example" 'bundle-digest: ${{ needs.sign.outputs.bundle-digest }}'

@@ -16,6 +16,9 @@ jobs:
       duckdb_version: v2.0.0
       ci_tools_version: v2.0-cyanoptera
       extension_name: my_ext
+      # Choose platforms here, and the later jobs follow. See "Choosing platforms" in the README.
+      # exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
+      # opt_in_archs: 'osx_amd64'
 
   # Has the signing key, and never runs your extension's code. Environment secrets with required reviewers keep the key away
   # from everything else in the repository.
@@ -26,6 +29,7 @@ jobs:
     environment: release-signing
     outputs:
       bundle-digest: ${{ steps.sign.outputs.bundle-digest }}
+      verify-runners: ${{ steps.sign.outputs.verify-runners }}
     steps:
       # Replace <commit-sha> with the commit of a release: this step handles your signing key.
       - id: sign
@@ -37,15 +41,14 @@ jobs:
           # Listed in the key file, so that clients can pin it too. See "Rotating keys" in the README.
           additional-public-keys: ${{ vars.EXTENSION_RESERVE_PUBLIC_KEY }}
 
-  # Runs your extension's code, so it has no secrets at all. A runner can only test its own platform, so these cover Linux
-  # on x86 and Arm, and macOS on Apple Silicon. For Intel Macs, add macos-26-intel here and opt_in_archs: osx_amd64 to the
-  # build job.
+  # Runs your extension's code, so it has no secrets at all. A runner can only test its own platform, so the sign job lists
+  # the runners for what was really built.
   verify:
     needs: sign
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]
+        os: ${{ fromJSON(needs.sign.outputs.verify-runners) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions: {}

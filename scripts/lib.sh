@@ -115,6 +115,28 @@ cli_asset() { # <platform>
 	printf 'duckdb-cli-%s' "$(printf '%s' "$1" | tr '_' '-')"
 }
 
+# The GitHub-hosted runner that can load each platform's builds. Other platforms have none: the action doesn't run on
+# Windows, GitHub has no musl runners, and Wasm runs in a browser. These aren't upstream's build runners, because upstream
+# cross-compiles osx_amd64 on an Arm Mac.
+VERIFY_RUNNERS='{"linux_amd64":"ubuntu-24.04","linux_arm64":"ubuntu-24.04-arm","osx_amd64":"macos-26-intel","osx_arm64":"macos-26"}'
+
+# A JSON array for the verify job's matrix: one runner for each platform in the manifest that has one. Never empty, because
+# an empty matrix fails the job, and 'publish' would then need a condition that also lets it run after a skipped verify job.
+verify_runners() { # <manifest> <JSON object of labels that replace the defaults, or nothing>
+	local labels=${2:-}
+	[ -n "$labels" ] || labels='{}'
+	jq -s -c --argjson defaults "$VERIFY_RUNNERS" --argjson labels "$labels" '
+		($defaults + $labels) as $runners
+		| [.[].platform | $runners[.] // empty] | unique
+		| if . == [] then [$runners.linux_amd64] else . end
+	' "$1"
+}
+
+# The platforms in the manifest that no runner can load, comma separated.
+platforms_without_runner() { # <manifest>
+	jq -s -r --argjson runners "$VERIFY_RUNNERS" '[.[].platform | select($runners[.] == null)] | unique | join(", ")' "$1"
+}
+
 # Prints lt, eq or gt for two versions that start with major.minor.patch, and unknown if either doesn't, like a commit hash.
 compare_versions() { # <a> <b>
 	local pattern='^v?([0-9]+)\.([0-9]+)\.([0-9]+)' a_major a_minor a_patch pair a b

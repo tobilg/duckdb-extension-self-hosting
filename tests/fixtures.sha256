@@ -6,3 +6,4 @@ af1e87fb881ad8ff141ea48d630f3a6d5cc53a0fb85f4b387e46474043f507ff  community/v2.0
 d4b8a4fe6293d70f250a600f5e7bf68d79683f12f291d73aaf38b3a9f2eb5141  community/v2.0.0/osx_arm64/capi_quack.duckdb_extension
 5f4e747b02b563b27b6479d238dd0e9a3721d0dda060668bb42e00f30904312e  community/v2.0.0/wasm_eh/capi_quack.duckdb_extension.wasm
 1c81405d0f0bb6f0bc6edf430cc3262fd5e226c207a6c445b57afd4eb1c58ee4  core/v2.0.0/wasm_eh/inet.duckdb_extension.wasm
+59f38bb9c67b3dcb677e7d156a60f709a3619999dda36a29852733456c7bf9a0  core/v2.0.0/osx_amd64/inet.duckdb_extension

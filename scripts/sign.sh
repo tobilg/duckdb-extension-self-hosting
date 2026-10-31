@@ -307,4 +307,5 @@ fi
 
 set_output signed-dir "$signed_dir"
 set_output bundle-digest "$(bundle_digest "$bundle_dir")"
+set_output verify-runners "$(verify_runners "$manifest" "${INPUT_VERIFY_RUNNER_LABELS:-}")"
 info "Signed $(wc -l <"$item_list" | tr -d '[:space:]') binaries."

@@ -37,6 +37,9 @@ inputs:
   exclude-platforms:
     description: Comma or space separated platforms to skip, such as wasm_mvp. Takes * and ? as wildcards, such as wasm_*.
     required: false
+  verify-runner-labels:
+    description: 'JSON object that replaces the runner for a platform in the verify-runners output, such as {"osx_arm64": "my-mac-runner"}. Takes one label each, and only platforms that have a runner.'
+    required: false
   duckdb-version:
     description: DuckDB version directory with its leading v, such as v2.0.0, or a comma separated list. Only required for C_STRUCT builds. Other builds take it from their footer.
     required: false
@@ -119,6 +122,9 @@ outputs:
   bundle-digest:
     description: Digest of the signed tree. Pass it from the sign job to the input of the same name in the publish job.
     value: ${{ steps.sign.outputs.bundle-digest }}
+  verify-runners:
+    description: JSON array for the matrix of the verify job, with one runner for each platform in the signed tree that has one. Never empty. Set in mode 'sign'.
+    value: ${{ steps.sign.outputs.verify-runners }}
   files:
     description: JSON array with platform, versions, ABI and object path of each file, the SHA-256 of the object (sha256) and of the binary inside it (binary_sha256).
     value: ${{ steps.summary.outputs.files }}
@@ -152,6 +158,7 @@ runs:
         INPUT_ALLOW_KEY_CHANGE: ${{ inputs.allow-key-change }}
         INPUT_ALLOW_DOWNGRADE: ${{ inputs.allow-downgrade }}
         INPUT_CHECK_REPOSITORY: ${{ inputs.check-repository }}
+        INPUT_VERIFY_RUNNER_LABELS: ${{ inputs.verify-runner-labels }}
         HAS_SIGNING_KEY: ${{ inputs.signing-key != '' }}
         HAS_S3_ACCESS_KEY_ID: ${{ inputs.s3-access-key-id != '' }}
         HAS_S3_SECRET_ACCESS_KEY: ${{ inputs.s3-secret-access-key != '' }}
@@ -177,6 +184,7 @@ runs:
         INPUT_ADDITIONAL_PUBLIC_KEYS: ${{ inputs.additional-public-keys }}
         INPUT_EXTENSION_NAME: ${{ inputs.extension-name }}
         INPUT_EXCLUDE_PLATFORMS: ${{ inputs.exclude-platforms }}
+        INPUT_VERIFY_RUNNER_LABELS: ${{ inputs.verify-runner-labels }}
         INPUT_DUCKDB_VERSION: ${{ inputs.duckdb-version }}
         INPUT_EXTENSION_VERSION: ${{ inputs.extension-version }}
         INPUT_UPLOAD_LATEST: ${{ inputs.upload-latest }}
