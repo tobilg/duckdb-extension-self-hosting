@@ -4,7 +4,7 @@
   "description": "Loads what the action signs in DuckDB-Wasm, in headless Chrome.",
   "dependencies": {
     "@duckdb/duckdb-wasm": "1.33.1-dev110.0",
-    "esbuild": "0.28.1",
+    "esbuild": "0.28.2",
     "puppeteer-core": "25.16.0"
   }
 }
