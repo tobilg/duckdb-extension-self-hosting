@@ -779,6 +779,37 @@ check_equal 'and the key file is unchanged' "$BEFORE" "$(sha256_file "$BUCKET/bu
 if upload INPUT_ALLOW_KEY_CHANGE=true; then pass 'allow-key-change lets a rotation through'; else fail 'allow-key-change lets a rotation through' "$(tail -n 2 "$RUN_LOG")"; fi
 check_contains 'with a warning' "$RUN_LOG" 'Clients have to pin it'
 check_contains 'and another that it drops the old key' "$RUN_LOG" 'drops 1 key(s)'
+new_bucket key_drop
+signed_work key_drop_first "$U/v1" "$K/key.pem" INPUT_ADDITIONAL_PUBLIC_KEYS="$(cat "$K/reserve.pub")"
+upload
+BEFORE=$(sha256_file "$BUCKET/bucket/.well-known/duckdb-extension-repo.json")
+signed_work key_drop_second "$U/v2" "$K/key.pem"
+: >"$RCLONE_LOG"
+check_refused_upload 'a repository that leaves out a key from the shared key file is refused' 'would drop 1 key(s)'
+check_contains 'and names the list to fix' "$RUN_LOG" 'additional-public-keys'
+check_contains 'and the option to remove the key' "$RUN_LOG" 'allow-key-change'
+check_equal 'nothing was uploaded' 0 "$(grep -vc '^copyto :s3:' "$RCLONE_LOG")"
+check_equal 'and the key file still has both keys' "$BEFORE" "$(sha256_file "$BUCKET/bucket/.well-known/duckdb-extension-repo.json")"
+: >"$RUN_LOG"
+if upload INPUT_ALLOW_KEY_CHANGE=true; then pass 'allow-key-change removes it on purpose'; else fail 'allow-key-change removes it on purpose' "$(tail -n 2 "$RUN_LOG")"; fi
+check_contains 'with a warning' "$RUN_LOG" 'drops 1 key(s)'
+check_equal 'and the key file has one key left' 1 "$(jq '.signature_keys | length' "$BUCKET/bucket/.well-known/duckdb-extension-repo.json")"
+new_bucket key_keep
+signed_work key_keep_first "$U/v1" "$K/key.pem" INPUT_ADDITIONAL_PUBLIC_KEYS="$(cat "$K/reserve.pub")"
+upload
+BEFORE=$(sha256_file "$BUCKET/bucket/.well-known/duckdb-extension-repo.json")
+signed_work key_keep_second "$U/v2" "$K/key.pem" INPUT_ADDITIONAL_PUBLIC_KEYS="$(cat "$K/reserve.pub")"
+: >"$RUN_LOG"
+if upload; then pass 'a repository that lists the same keys is fine'; else fail 'a repository that lists the same keys is fine' "$(tail -n 2 "$RUN_LOG")"; fi
+check_equal 'and the key file stays the same' "$BEFORE" "$(sha256_file "$BUCKET/bucket/.well-known/duckdb-extension-repo.json")"
+new_bucket key_no_file
+signed_work key_no_file_first "$U/v1" "$K/key.pem" INPUT_ADDITIONAL_PUBLIC_KEYS="$(cat "$K/reserve.pub")"
+upload
+BEFORE=$(sha256_file "$BUCKET/bucket/.well-known/duckdb-extension-repo.json")
+signed_work key_no_file_second "$U/v2" "$K/key.pem" INPUT_PUBLISH_KEY_FILE=false
+: >"$RUN_LOG"
+if upload; then pass 'a repository that does not publish the key file leaves it alone'; else fail 'a repository that does not publish the key file leaves it alone' "$(tail -n 2 "$RUN_LOG")"; fi
+check_equal 'so nothing is dropped' "$BEFORE" "$(sha256_file "$BUCKET/bucket/.well-known/duckdb-extension-repo.json")"
 new_bucket key_reserve
 signed_work key_reserve_first "$U/v1" "$K/key.pem" INPUT_ADDITIONAL_PUBLIC_KEYS="$(cat "$K/reserve.pub")"
 upload
@@ -977,6 +1008,19 @@ while [ $# -gt 0 ]; do
 done
 object=${url#https://cdn.invalid/}
 printf '%s %s\n' "$object" "$encoding" >>"$FAKE_CDN_LOG"
+if [ -n "${FAKE_CDN_DOWN:-}" ]; then
+	printf 000
+	exit 7
+fi
+if [ -n "${FAKE_CDN_STATUS:-}" ]; then
+	printf '%s' "$FAKE_CDN_STATUS"
+	exit 0
+fi
+# A 404 from before the upload that the CDN still has, for this many requests of each object.
+if [ -n "${FAKE_CDN_CACHED_404:-}" ] && [ "$(grep -cxF "$object $encoding" "$FAKE_CDN_LOG")" -le "$FAKE_CDN_CACHED_404" ]; then
+	printf 404
+	exit 0
+fi
 if [ ! -f "$FAKE_BUCKET/bucket/$object" ]; then
 	printf 404
 	exit 0
@@ -1005,6 +1049,39 @@ check_contains 'while Wasm objects ask for Brotli, which a CDN must not unpack' 
 printf '{"signature_keys":[]}' >"$BUCKET/bucket/.well-known/duckdb-extension-repo.json"
 : >"$RUN_LOG"
 check_refused 'a stale key file still fails through a CDN' 'different key file' check_repository PATH="$CDN:$PATH" INPUT_REPOSITORY_URL=https://cdn.invalid FAKE_CDN_LOG="$CDN_LOG"
+new_bucket check_404
+signed_work check_404 "$U/v1" "$K/key.pem"
+upload
+cdn_check() { # [VAR=value...]
+	: >"$RUN_LOG"
+	: >"$CDN_LOG"
+	check_repository PATH="$CDN:$PATH" INPUT_REPOSITORY_URL=https://cdn.invalid FAKE_CDN_LOG="$CDN_LOG" "$@"
+}
+requests_for() { grep -c "^$1 " "$CDN_LOG" | tr -d ' '; }
+if cdn_check FAKE_CDN_CACHED_404=1 REPOSITORY_RETRY_INTERVAL=0; then pass 'a 404 a CDN kept from before the upload passes once it is gone'; else fail 'a 404 a CDN kept from before the upload passes once it is gone' "$(tail -n 2 "$RUN_LOG" | cut -c1-200)"; fi
+check_contains 'and says why it waits' "$RUN_LOG" 'A CDN can keep one from before the upload'
+check_contains 'and how long' "$RUN_LOG" 'up to 240 seconds'
+check_equal 'it asks again after the 404, and stops after the answer' 2 "$(requests_for v2.0.0/osx_arm64/demo.duckdb_extension.gz)"
+check_not_contains 'without an error' "$RUN_LOG" '::error'
+check_contains 'and compares what it finally gets' "$RUN_LOG" 'serves what was uploaded'
+if cdn_check; then pass 'a repository without a 404 needs no retry'; else fail 'a repository without a 404 needs no retry' "$(tail -n 2 "$RUN_LOG" | cut -c1-200)"; fi
+check_equal 'and asks once' 1 "$(requests_for v2.0.0/osx_arm64/demo.duckdb_extension.gz)"
+check_not_contains 'and does not mention it' "$RUN_LOG" 'tries again'
+if cdn_check FAKE_CDN_CACHED_404=100000 REPOSITORY_RETRY_SECONDS=1 REPOSITORY_RETRY_INTERVAL=1; then fail 'a 404 that stays fails'; else pass 'a 404 that stays fails'; fi
+check_contains 'and names the object' "$RUN_LOG" 'v2.0.0/osx_arm64/demo.duckdb_extension.gz answered with 404'
+check_contains 'and the wrong URL it probably means' "$RUN_LOG" "Check that 'repository-url' matches the bucket"
+check_contains 'and what to do if it is the CDN' "$RUN_LOG" 're-run this job later'
+check_equal 'the limit is for the whole check, so that a wrong URL does not wait for every object' 1 "$(requests_for .well-known/duckdb-extension-repo.json)"
+check 'while the objects before it were tried again' test "$(requests_for v2.0.0/osx_arm64/demo.duckdb_extension.gz)" -ge 2
+if cdn_check FAKE_CDN_CACHED_404=100000 REPOSITORY_RETRY_SECONDS=0; then fail 'no time to wait fails at once'; else pass 'no time to wait fails at once'; fi
+check_equal 'after one request' 1 "$(requests_for v2.0.0/osx_arm64/demo.duckdb_extension.gz)"
+if cdn_check FAKE_CDN_STATUS=403 REPOSITORY_RETRY_SECONDS=30 REPOSITORY_RETRY_INTERVAL=30; then fail 'a private bucket fails'; else pass 'a private bucket fails'; fi
+check_equal 'at once, because only a 404 can be a leftover' 1 "$(requests_for v2.0.0/osx_arm64/demo.duckdb_extension.gz)"
+check_contains 'and suggests a public bucket' "$RUN_LOG" 'answered with 403'
+check_not_contains 'and not a CDN' "$RUN_LOG" 're-run this job later'
+if cdn_check FAKE_CDN_DOWN=1 REPOSITORY_RETRY_SECONDS=30 REPOSITORY_RETRY_INTERVAL=30; then fail 'a repository that does not answer fails'; else pass 'a repository that does not answer fails'; fi
+check_contains 'and says so' "$RUN_LOG" 'answered with no response,'
+check_equal 'at once' 1 "$(requests_for v2.0.0/osx_arm64/demo.duckdb_extension.gz)"
 
 echo; echo '--- summary'
 new_step_run summary
@@ -1240,13 +1317,27 @@ $(grep -oE 'secrets\.[A-Z0-9_]+' "$QUICK_START" | sed 's/secrets\.//' | sort -u)
 EOF
 check_equal 'and sets every secret its jobs read' '' "$unset_secrets"
 MAIN_PUSHES="$RUNS_DIR/main-pushes.md"
-sed -n '/^## Publishing every push to main/,/^## What stops a release/p' "$TESTS_ROOT/README.md" >"$MAIN_PUSHES"
+sed -n '/^## Publishing every push to main/,/^## Several extensions/p' "$TESTS_ROOT/README.md" >"$MAIN_PUSHES"
 check_contains 'the README shows how to publish pushes to main' "$MAIN_PUSHES" "github.ref == 'refs/heads/main'"
+check_contains 'and tags from one workflow' "$MAIN_PUSHES" "startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'"
+check_contains 'which runs on both' "$MAIN_PUSHES" "tags: ['*']"
+for mode in sign verify publish; do
+	check_contains "with the whole $mode job, because a job edited by hand loses its condition" "$MAIN_PUSHES" "mode: $mode"
+done
+check_equal 'and a timeout on each' 3 "$(grep -c 'timeout-minutes:' "$MAIN_PUSHES")"
+check_contains 'and says what each trigger publishes' "$MAIN_PUSHES" '| Push to `main` | Yes | `https://extensions.example.com/dev` | Commit hash | Latest path only |'
+check_contains 'and how a client moves to a newer build' "$MAIN_PUSHES" 'FORCE INSTALL my_ext FROM my_repo_dev;'
 check_contains 'not on a manual run' "$MAIN_PUSHES" "github.event_name == 'push'"
 check_contains 'without a versioned path, which a rebuild can not replace' "$MAIN_PUSHES" "upload-versioned: \${{ startsWith(github.ref, 'refs/tags/') }}"
 check_contains 'on a path of their own' "$MAIN_PUSHES" "s3-prefix: \${{ !startsWith(github.ref, 'refs/tags/') && 'dev' || '' }}"
 check_contains 'which clients of that path read back' "$MAIN_PUSHES" "'https://extensions.example.com/dev' }}"
 check_not 'with no condition that always picks one side, because an empty string is false' grep -qE "^ +[a-z0-9-]+: .*&& '' \|\|" "$MAIN_PUSHES"
+SEVERAL="$RUNS_DIR/several.md"
+sed -n '/^## Several extensions/,/^## What stops a release/p' "$TESTS_ROOT/README.md" >"$SEVERAL"
+check_contains 'the README says how extensions share a bucket' "$SEVERAL" 'INSTALL other_ext FROM my_repo;'
+check_contains 'and how one repository publishes several' "$SEVERAL" "artifact-pattern: '*-extension-*'"
+check_contains 'and that the key file is shared' "$SEVERAL" 'share the key file'
+check_contains 'the README names the 404 that a CDN can keep' "$TESTS_ROOT/README.md" 'for 3 minutes by default'
 check_contains 'CI checks that verify is skipped with sign, which the quick start relies on' "$TESTS_ROOT/.github/workflows/ci.yml" 'os: ${{ fromJSON(needs.no-tag-sign.outputs.verify-runners) }}'
 check_contains 'CI takes the verify runners from the sign job, so a real run proves it' "$TESTS_ROOT/.github/workflows/ci.yml" 'os: ${{ fromJSON(needs.action-sign.outputs.verify-runners) }}'
 RUNNER_MAP=$(lib_call 'printf "%s" "$VERIFY_RUNNERS"' | jq -r 'to_entries[] | "\(.key) \(.value)"')

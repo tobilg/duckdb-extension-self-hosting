@@ -121,7 +121,7 @@ jobs:
           test "$(jq -r '[.[].name] | unique | join(",")' <<<"$FILES")" = inet,rusty_quack
           test "$RUNNERS" = '["macos-26","macos-26-intel","ubuntu-24.04","ubuntu-24.04-arm"]'
 
-      - name: An empty signing key fails
+      - name: 'Expected to fail: an empty signing key'
         id: empty-key
         continue-on-error: true
         uses: ./
@@ -163,7 +163,7 @@ jobs:
           test -f "$SIGNED_DIR/.well-known/duckdb-extension-repo.json"
           [[ "$FINGERPRINT" =~ ^sha256:[0-9a-f]{64}$ ]]
 
-      - name: Setup SQL that fails
+      - name: 'Expected to fail: setup SQL that fails'
         id: failed-smoke
         continue-on-error: true
         uses: ./
@@ -234,7 +234,7 @@ jobs:
           s3-secret-access-key: ${{ env.S3_SECRET_ACCESS_KEY }}
           check-repository: 'false'
 
-      - name: A wrong digest stops the upload
+      - name: 'Expected to fail: a wrong digest stops the upload'
         id: wrong-digest
         continue-on-error: true
         uses: ./
@@ -307,7 +307,7 @@ jobs:
             exit 1
           fi
           sed 's/^::error:://' output
-          grep -F "'id-token: write'" output
+          grep -qF "'id-token: write'" output
 
   action-one-job:
     name: Refuse to run native code in a job with secrets
@@ -333,7 +333,7 @@ jobs:
           path: ${{ runner.temp }}/binaries
           signing-key: ${{ env.TEST_SIGNING_KEY }}
           signed-artifact: ci-one-job
-      - name: Verify in the same job
+      - name: 'Expected to fail: verify in the same job'
         id: same-job
         continue-on-error: true
         uses: ./

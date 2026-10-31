@@ -97,7 +97,7 @@ inputs:
     required: false
     default: 'false'
   allow-key-change:
-    description: Allow a signing key that isn't in the bucket's key file, for a key rotation. By default that fails the run.
+    description: Allow a signing key that isn't in the bucket's key file, or a key file that removes a key from it, for a key rotation. By default both fail the run.
     required: false
     default: 'false'
   allow-downgrade:
@@ -108,7 +108,7 @@ inputs:
     description: Public prefix clients use, such as https://extensions.example.com. Has to start with https://, http:// or s3://. Without it, the check and summary use s3://<bucket>/<prefix>.
     required: false
   check-repository:
-    description: After uploading, read every object back through repository-url and compare the bytes. Runs no downloaded code.
+    description: After uploading, read every object back through repository-url and compare the bytes, trying a 404 again for up to 4 minutes. Runs no downloaded code.
     required: false
     default: 'true'
 

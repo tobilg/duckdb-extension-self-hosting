@@ -20,7 +20,7 @@ The shortest way to add this to an extension repository that uses DuckDB's stand
 
 ### 1. Create a key and a bucket
 
-You only need one of each, and your extensions can share them.
+You only need one of each, and [your extensions can share them](#several-extensions).
 
 ```bash
 openssl genrsa -out signing_key.pem 2048
@@ -307,10 +307,10 @@ For `mode: publish`:
 | `s3-provider` | detected | [rclone provider](https://rclone.org/s3/) |
 | `s3-access-key-id`, `s3-secret-access-key`, `s3-session-token` | `AWS_*` variables | Credentials. Set the key ID and secret together. Setting them ignores any `AWS_SESSION_TOKEN` in the environment. Leave them out to use a [role through OIDC](#publishing-to-aws-with-oidc). |
 | `overwrite-versioned` | `false` | Allow replacing a versioned object with different bytes |
-| `allow-key-change` | `false` | Allow a signing key that isn't in the bucket's key file, for a [rotation](#rotating-keys) |
+| `allow-key-change` | `false` | Allow a signing key that isn't in the bucket's key file, or a key file that removes a key from it, for a [rotation](#rotating-keys) |
 | `allow-downgrade` | `false` | Allow moving the latest path to a lower version |
 | `repository-url` | `s3://<bucket>/<prefix>` | Public prefix clients use. Has to start with `https://`, `http://` or `s3://`. |
-| `check-repository` | `true` | Read every object back through `repository-url` and compare the bytes |
+| `check-repository` | `true` | Read every object back through `repository-url` and compare the bytes, trying a 404 again for up to 4 minutes |
 
 ## Outputs
 
@@ -377,32 +377,84 @@ Upstream's tests are your extension's own SQL tests, run in the build job as of 
 
 ## Publishing every push to main
 
-The [Quick start](#3-add-the-jobs) only publishes tags. To also publish every push to `main`, change these lines in its jobs, which send those builds to a separate `dev` path:
+The [Quick start](#3-add-the-jobs) only publishes tags. To also publish every push to `main`, send those builds to a separate `dev` path, so that clients of your releases never get them:
+
+| Trigger | Signed and published | Clients use | Version | Objects |
+| --- | --- | --- | --- | --- |
+| Tag | Yes | `https://extensions.example.com` | The tag | Latest and versioned paths |
+| Push to `main` | Yes | `https://extensions.example.com/dev` | Commit hash | Latest path only |
+| Pull request or manual run | No | | | |
+
+The workflow has to run on both:
+
+```yaml
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+```
+
+These jobs take the place of the Quick start's. Make the [same replacements](#3-add-the-jobs):
 
 ```yaml
   sign:
     if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main')
-    # ...
+    needs: duckdb-stable-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      bundle-digest: ${{ steps.sign.outputs.bundle-digest }}
+      verify-runners: ${{ steps.sign.outputs.verify-runners }}
     steps:
       - id: sign
         uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
         with:
-          # ...
+          mode: sign
+          extension-name: my_ext
+          signing-key: ${{ secrets.EXTENSION_SIGNING_KEY }}
           upload-versioned: ${{ startsWith(github.ref, 'refs/tags/') }}
 
-  publish:
-    # ...
+  verify:
+    needs: sign
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.sign.outputs.verify-runners) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions: {}
     steps:
       - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
         with:
-          # ...
+          mode: verify
+
+  publish:
+    needs: [sign, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: publish-my_ext
+      cancel-in-progress: false
+    steps:
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+        with:
+          mode: publish
+          bundle-digest: ${{ needs.sign.outputs.bundle-digest }}
+          s3-endpoint: ${{ secrets.S3_ENDPOINT }}
+          s3-bucket: my-extensions
+          s3-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.S3_SECRET_ACCESS_KEY }}
           s3-prefix: ${{ !startsWith(github.ref, 'refs/tags/') && 'dev' || '' }}
           repository-url: ${{ startsWith(github.ref, 'refs/tags/') && 'https://extensions.example.com' || 'https://extensions.example.com/dev' }}
 ```
 
-Keep the `s3-prefix` condition in that order. GitHub treats `''` as false, so `x && '' || 'dev'` would always give `dev`.
+Three things here are easy to break:
 
-Clients that want these builds add a second repository, and run `FORCE INSTALL` to move to a newer one:
+- **The `if` on `sign`.** Without it, a pull request from a branch in your repository gets signed and published, with no review.
+- **The order in `s3-prefix`.** GitHub has no real ternary, and treats `''` as false. So `x && '' || 'dev'`, which looks the same, always gives `dev`, and your tags upload to the wrong path.
+- **The commit you tag.** A tag runs the workflow of its own commit, so a fix on `main` doesn't reach a tag on an older commit.
+
+Clients that want these builds add a second repository:
 
 ```sql
 SET allow_extension_repositories = 'allowed';
@@ -411,6 +463,17 @@ CREATE EXTENSION REPOSITORY IF NOT EXISTS my_repo_dev
 INSTALL my_ext FROM my_repo_dev;
 LOAD my_ext FROM my_repo_dev;
 ```
+
+To move to a newer build, start a new session, because a loaded extension can't be replaced:
+
+```sql
+SET allow_extension_repositories = 'allowed';
+FORCE INSTALL my_ext FROM my_repo_dev;
+LOAD my_ext FROM my_repo_dev;
+SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'my_ext';
+```
+
+The version is the commit's short hash. On the same machine, `LOAD my_ext FROM my_repo` still gets your tagged release.
 
 A build without a tag has a commit hash as its version, which is why these go elsewhere:
 
@@ -425,6 +488,23 @@ Publishing this way also changes a few things:
 - **Environments need to allow it.** A rule that only allows tags has to allow `main` too.
 - **Each push adds the verify runners.** That's free on public repositories, but counts against your budget on private ones.
 
+## Several extensions
+
+Your extensions can share one bucket, one key and one repository for clients, who create it once and then install from it:
+
+```sql
+INSTALL my_ext FROM my_repo;
+INSTALL other_ext FROM my_repo;
+```
+
+Each extension only writes its own objects and the shared key file, and the action never deletes anything. Versions are compared per extension, and publish jobs from different repositories can overlap.
+
+- **One repository per extension:** add the [jobs](#3-add-the-jobs) to each, with the same `s3-bucket`, `repository-url`, `EXTENSION_SIGNING_KEY` and `additional-public-keys`.
+- **Several extensions in one repository:** list every build job in `needs` on the sign job, and replace `extension-name` with `all-extensions: true` and `artifact-pattern: '*-extension-*'`. `verify` then loads all of them. A workflow that signs in more than one job needs a different `signed-artifact` for each, on all three of its jobs.
+- **A key for each extension:** give each its own `s3-prefix` and `repository-url`. It then gets its own key file, and clients create one repository per extension.
+
+All repositories in a bucket have to agree on the keys, because they share the key file. A different signing key, or a list that leaves out a key the file already has, [fails the run](#what-stops-a-release). To [rotate the key](#rotating-keys), change it in every repository.
+
 ## What stops a release
 
 Each of these fails the run before anything is uploaded:
@@ -432,10 +512,11 @@ Each of these fails the run before anything is uploaded:
 - **A build that doesn't load.** The verify jobs run first, and `publish` has `needs` on them. A failure there leaves the bucket as it was, so `latest` keeps working and the version number stays free for a fixed build. This only covers [the platforms `verify` has a runner for](#choosing-platforms).
 - **A signed tree that changed.** `bundle-digest` comes from the sign job through GitHub's job outputs, which the verify job can't touch.
 - **A signing key clients don't know.** If the bucket has a key file and doesn't list the signing key, clients that pinned those keys would reject the release. This catches a wrong secret. A rotation sets `allow-key-change`.
+- **A key file that would lose a key.** The file is shared by [every extension in the bucket](#several-extensions), so a repository that doesn't list your reserve key would remove it for all of them. Removing a key on purpose sets `allow-key-change`.
 - **A lower version on the latest path.** This catches an older tag re-run after a newer one. It compares major.minor.patch with what's live, and only leaves a notice if a version isn't in that form, like a commit hash. Deliberate rollbacks set `allow-downgrade`.
 - **Different bytes for a published version.** Rebuilding produces different bytes, so re-running a release with new builds hits this. Re-running only the failed job is safe, because it uses the same signed tree. So is signing the same build again, which gives the same bytes.
 
-After the upload, the publish job reads every object and the key file back through `repository-url`, for all platforms. A failure there means a wrong URL or a CDN serving an older object. These objects are already live at that point, and the job summary says so.
+After the upload, the publish job reads every object and the key file back through `repository-url`, for all platforms. A failure there means a wrong URL or a CDN serving an older object. These objects are already live at that point, and the job summary says so. A 404 gets tried again for up to 4 minutes first, because [a CDN can keep one from before the upload](#serving-the-bucket), so a wrong URL takes that long to fail.
 
 If the upload itself fails partway, the summary and `uploaded-objects` list what went live. Re-run the job to finish it.
 
@@ -547,6 +628,12 @@ On Cloudflare R2, use a custom domain. Cloudflare says public access through `r2
 
 Custom domains go through Cloudflare's cache, which [keeps `.gz` files for 2 hours by default](https://developers.cloudflare.com/cache/concepts/default-cache-behavior/). The latest paths keep their names between releases, so the action stores `Cache-Control: no-cache` on them and on the key file, and `public, max-age=86400` on versioned objects. A Cache Rule of your own can override that. If a client could still get an old copy, the check after the upload fails with a "different build" error, and you can purge the path. After `overwrite-versioned`, purge the versioned path too.
 
+Three more things to know about that cache:
+
+- **A path requested before its first upload.** Cloudflare [caches that 404 too, for 3 minutes by default](https://developers.cloudflare.com/cache/concepts/default-cache-behavior/), on paths it caches by file extension, such as `.gz`. Clients keep getting the 404 until it expires, even after the upload. The check after the upload waits for that.
+- **Files you uploaded by hand or deleted.** They don't have the action's `no-cache`, so Cloudflare keeps serving them, also after you delete them. Purge those paths before your first release: under **Caching > Configuration > Custom Purge**, purge by URL.
+- **Browser Cache TTL.** [This zone setting](https://developers.cloudflare.com/cache/how-to/edge-browser-cache-ttl/set-browser-ttl/) replaces `no-cache` in the response with its own `max-age`. Only browsers follow that, so it affects DuckDB-Wasm and not native clients. To keep `no-cache`, set it to **Respect Existing Headers**.
+
 ## Security
 
 - **Pin the action by commit.** It handles your signing key: `uses: tobilg/duckdb-extension-self-hosting@<sha> # v1.0.0`.
@@ -572,6 +659,7 @@ Keys only change when a client creates the repository again:
 2. Publish with the new `signing-key`, and list the old public key in `additional-public-keys` on the sign job. Set `allow-key-change: true` on the publish job, unless the new key is already in the bucket's key file as your reserve key. Set `overwrite-versioned: true` too if you re-sign an existing version.
 3. On each client, run `FORCE INSTALL` for the installed extensions.
 4. On each client, remove the old key with another `CREATE OR REPLACE`.
+5. Once nothing in the bucket is signed with the old key, stop listing it in `additional-public-keys`, and set `allow-key-change: true` for that publish.
 
 Removing a key makes builds signed with it fail on the next `LOAD`, so finish step 3 first.
 

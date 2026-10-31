@@ -432,6 +432,13 @@ fi
 check_contains 'with a hint' "$RUN_LOG" 'Check the credentials'
 
 echo; echo '--- the repository check catches a repository clients can not use'
+if publish wrongprefix env-bucket "$KEY_ONE" INPUT_REPOSITORY_URL="$PUBLIC/does-not-exist" REPOSITORY_RETRY_SECONDS=2 REPOSITORY_RETRY_INTERVAL=1; then
+	fail 'a repository-url that answers with 404 fails the check'
+else
+	pass 'a repository-url that answers with 404 fails the check'
+fi
+check_contains 'after trying again, in case a CDN kept the 404' "$RUN_LOG" 'tries again for up to 2 seconds'
+check_contains 'and says what to look at' "$RUN_LOG" 'answered with 404'
 if publish wrongurl env-bucket "$KEY_ONE" INPUT_REPOSITORY_URL="$S3_ENDPOINT/does-not-exist"; then
 	fail 'a wrong repository-url fails the check'
 else
@@ -458,5 +465,149 @@ check_contains 'and says that it is another build' "$RUN_LOG" 'different build'
 publish fresh rotate-bucket "$KEY_TWO" INPUT_PATH="$OTHER_BUILD" INPUT_S3_PREFIX=staging INPUT_REPOSITORY_URL="$ROTATE/staging"
 ok_or_log 'the same build passes at the right URL' $?
 check_contains 'the check ran' "$RUN_LOG" 'serves what was uploaded'
+
+echo; echo '--- several extensions in one bucket'
+# Two repositories that share a bucket and a key. Each job gets only what its workflow would pass it.
+SHARED="$PUBLIC/several"
+extension_build() { # <extension> <version>: prints a directory with that build
+	local directory="$RUNS_DIR/build-$1-$2" source_dir=native
+	if [ "$1" = capi_quack ]; then source_dir=stable; fi
+	mkdir -p "$directory"
+	cp "$RUNS_DIR/$source_dir/$1.duckdb_extension" "$directory/"
+	set_footer_field "$directory/$1.duckdb_extension" 384 "$2"
+	printf '%s' "$directory"
+}
+sign_extension() { # <run name> <extension> <version> <signing key> [VAR=value...]
+	local name=$1 extension=$2 version=$3 key=$4
+	shift 4
+	run_action "$name-sign" INPUT_MODE=sign INPUT_EXTENSION_NAME="$extension" INPUT_PATH="$(extension_build "$extension" "$version")" INPUT_SIGNING_KEY="$key" INPUT_DUCKDB_VERSION="$VERSION" "$@"
+}
+release_extension() { # <run name> <extension> <version> <signing key> [VAR=value for the sign job...]
+	local name=$1
+	sign_extension "$@" || return 1
+	upload_bundle "$name" public-bucket "$(bundle_dir)" "$(output_value bundle-digest)" INPUT_S3_PREFIX=several INPUT_REPOSITORY_URL="$SHARED"
+}
+shared_latest() { printf '%s/%s/%s/%s.duckdb_extension.gz' "$SHARED" "$VERSION" "$PLATFORM" "$1"; }
+shared_keys() { curl -s --cacert "$CA" "$SHARED/.well-known/duckdb-extension-repo.json" | jq '.signature_keys | length'; }
+release_extension several_a rusty_quack 1.0.0 "$KEY_ONE"
+ok_or_log 'the first extension publishes' $?
+FIRST_ETAG=$(http_header "$(shared_latest rusty_quack)" ETag)
+KEY_FILE_ETAG=$(http_header "$SHARED/.well-known/duckdb-extension-repo.json" ETag)
+release_extension several_b capi_quack 5.0.0 "$KEY_ONE"
+ok_or_log 'the second publishes next to it' $?
+check_equal 'the first is untouched' "$FIRST_ETAG" "$(http_header "$(shared_latest rusty_quack)" ETag)"
+check_equal 'the second is served' 5.0.0 "$(served_version "$(shared_latest capi_quack)")"
+check_equal 'the key file is unchanged' "$KEY_FILE_ETAG" "$(http_header "$SHARED/.well-known/duckdb-extension-repo.json" ETag)"
+if client several "$SETUP_SQL
+SET allow_extension_repositories = 'allowed';
+CREATE EXTENSION REPOSITORY IF NOT EXISTS mine WITH PREFIX '$SHARED';
+INSTALL rusty_quack FROM mine;
+INSTALL capi_quack FROM mine;
+LOAD rusty_quack FROM mine;
+LOAD capi_quack FROM mine;
+SELECT 'loaded=' || extension_name || '@' || extension_version FROM duckdb_extensions() WHERE extension_name IN ('rusty_quack', 'capi_quack') AND loaded;"; then
+	pass 'one client installs and loads both from one repository'
+else
+	fail 'one client installs and loads both from one repository' "$(tail -n 3 "$CLIENT_LOG")"
+fi
+check_contains 'the first' "$CLIENT_LOG" 'loaded=rusty_quack@1.0.0'
+check_contains 'the second' "$CLIENT_LOG" 'loaded=capi_quack@5.0.0'
+release_extension several_a2 rusty_quack 1.1.0 "$KEY_ONE"
+ok_or_log 'a version below the other extension is fine, because they compare per extension' $?
+if release_extension several_old rusty_quack 1.0.5 "$KEY_ONE"; then fail 'a lower version of the same extension is still refused'; else pass 'a lower version of the same extension is still refused'; fi
+check_contains 'and names that extension' "$RUN_LOG" 'rusty_quack for'
+sign_extension several_ca rusty_quack 1.2.0 "$KEY_ONE"
+FIRST_BUNDLE=$(bundle_dir)
+FIRST_DIGEST=$(output_value bundle-digest)
+sign_extension several_cb capi_quack 5.1.0 "$KEY_ONE"
+SECOND_BUNDLE=$(bundle_dir)
+SECOND_DIGEST=$(output_value bundle-digest)
+(upload_bundle several_ca public-bucket "$FIRST_BUNDLE" "$FIRST_DIGEST" INPUT_S3_PREFIX=several INPUT_REPOSITORY_URL="$SHARED") &
+FIRST_PID=$!
+(upload_bundle several_cb public-bucket "$SECOND_BUNDLE" "$SECOND_DIGEST" INPUT_S3_PREFIX=several INPUT_REPOSITORY_URL="$SHARED") &
+SECOND_PID=$!
+wait "$FIRST_PID"
+ok_or_log 'two repositories can publish at the same time' $?
+wait "$SECOND_PID"
+ok_or_log 'and both finish' $?
+check_equal 'the first is served' 1.2.0 "$(served_version "$(shared_latest rusty_quack)")"
+check_equal 'the second is served' 5.1.0 "$(served_version "$(shared_latest capi_quack)")"
+SECOND_ETAG=$(http_header "$(shared_latest capi_quack)" ETag)
+if release_extension several_other capi_quack 6.0.0 "$KEY_TWO"; then fail 'a repository with another key is refused'; else pass 'a repository with another key is refused'; fi
+check_contains 'and told why' "$RUN_LOG" "isn't in the bucket's key file"
+check_equal 'and changes nothing' "$SECOND_ETAG" "$(http_header "$(shared_latest capi_quack)" ETag)"
+sign_extension several_prefix capi_quack 6.0.0 "$KEY_TWO"
+upload_bundle several_prefix public-bucket "$(bundle_dir)" "$(output_value bundle-digest)" INPUT_S3_PREFIX=several-own-key INPUT_REPOSITORY_URL="$PUBLIC/several-own-key"
+ok_or_log 'but it can use a prefix of its own' $?
+sign_extension several_reserve rusty_quack 1.3.0 "$KEY_ONE" INPUT_ADDITIONAL_PUBLIC_KEYS="$(cat "$RUNS_DIR/keys/two.pub")"
+upload_bundle several_reserve public-bucket "$(bundle_dir)" "$(output_value bundle-digest)" INPUT_S3_PREFIX=several INPUT_REPOSITORY_URL="$SHARED"
+ok_or_log 'one repository adds a reserve key' $?
+check_equal 'the shared key file lists it' 2 "$(shared_keys)"
+if release_extension several_drop capi_quack 5.2.0 "$KEY_ONE"; then fail 'a repository that leaves it out can not remove it for everyone'; else pass 'a repository that leaves it out can not remove it for everyone'; fi
+check_contains 'and is told what to list' "$RUN_LOG" 'additional-public-keys'
+check_equal 'the key file still lists it' 2 "$(shared_keys)"
+check_equal 'and its build did not go out' 5.1.0 "$(served_version "$(shared_latest capi_quack)")"
+release_extension several_listed capi_quack 5.2.0 "$KEY_ONE" INPUT_ADDITIONAL_PUBLIC_KEYS="$(cat "$RUNS_DIR/keys/two.pub")"
+ok_or_log 'with the same list it publishes' $?
+mkdir -p "$RUNS_DIR/together"
+cp "$(extension_build rusty_quack 2.0.0)/rusty_quack.duckdb_extension" "$(extension_build capi_quack 7.0.0)/capi_quack.duckdb_extension" "$RUNS_DIR/together/"
+sign together_sign "$RUNS_DIR/together" "$KEY_ONE" INPUT_DUCKDB_VERSION="$VERSION"
+ok_or_log 'one repository signs two extensions in one run' $?
+TOGETHER_BUNDLE=$(bundle_dir)
+TOGETHER_DIGEST=$(output_value bundle-digest)
+verify together_verify "$TOGETHER_BUNDLE"
+ok_or_log 'and verify loads them' $?
+check_contains 'the first' "$RUN_LOG" 'Smoke test: rusty_quack'
+check_contains 'the second' "$RUN_LOG" 'Smoke test: capi_quack'
+upload_bundle together public-bucket "$TOGETHER_BUNDLE" "$TOGETHER_DIGEST" INPUT_S3_PREFIX=several-together INPUT_REPOSITORY_URL="$PUBLIC/several-together"
+ok_or_log 'and publish uploads them' $?
+check_equal 'the first is served' 2.0.0 "$(served_version "$PUBLIC/several-together/$VERSION/$PLATFORM/rusty_quack.duckdb_extension.gz")"
+check_equal 'the second is served' 7.0.0 "$(served_version "$PUBLIC/several-together/$VERSION/$PLATFORM/capi_quack.duckdb_extension.gz")"
+
+echo; echo '--- pushes to main and tags in one bucket'
+# With the values the README's workflow gives each job for that trigger, below a prefix to keep clear of the tests above.
+RELEASES="$PUBLIC/releases"
+main_push() { # <run name> <version>
+	sign_extension "$1" rusty_quack "$2" "$KEY_ONE" INPUT_UPLOAD_VERSIONED=false || return 1
+	upload_bundle "$1" public-bucket "$(bundle_dir)" "$(output_value bundle-digest)" INPUT_S3_PREFIX=releases/dev INPUT_REPOSITORY_URL="$RELEASES/dev"
+}
+tag_push() { # <run name> <version>
+	sign_extension "$1" rusty_quack "$2" "$KEY_ONE" INPUT_UPLOAD_VERSIONED=true || return 1
+	upload_bundle "$1" public-bucket "$(bundle_dir)" "$(output_value bundle-digest)" INPUT_S3_PREFIX=releases INPUT_REPOSITORY_URL="$RELEASES"
+}
+main_push main_first abc1234
+ok_or_log 'a push to main publishes' $?
+check_equal 'to the dev path' abc1234 "$(served_version "$RELEASES/dev/$LATEST")"
+check_equal 'with its own key file' 200 "$(http_status "$RELEASES/dev/.well-known/duckdb-extension-repo.json")"
+check_equal 'without a versioned path' 404 "$(http_status "$RELEASES/dev/rusty_quack/abc1234/$VERSION/$PLATFORM/rusty_quack.duckdb_extension.gz")"
+check_equal 'and not to the release path' 404 "$(http_status "$RELEASES/$LATEST")"
+tag_push tag_first 0.6.0
+ok_or_log 'a tag publishes' $?
+check_equal 'to the release path' 0.6.0 "$(served_version "$RELEASES/$LATEST")"
+check_equal 'with a versioned path' 0.6.0 "$(served_version "$RELEASES/rusty_quack/0.6.0/$VERSION/$PLATFORM/rusty_quack.duckdb_extension.gz")"
+check_equal 'and leaves the dev path alone' abc1234 "$(served_version "$RELEASES/dev/$LATEST")"
+main_push main_second def5678
+ok_or_log 'the next push to main publishes, although hashes can not be ordered' $?
+check_equal 'dev moves on' def5678 "$(served_version "$RELEASES/dev/$LATEST")"
+check_equal 'the release does not' 0.6.0 "$(served_version "$RELEASES/$LATEST")"
+BOTH_SQL="$SETUP_SQL
+SET allow_extension_repositories = 'allowed';
+CREATE EXTENSION REPOSITORY IF NOT EXISTS my_repo WITH PREFIX '$RELEASES';
+CREATE EXTENSION REPOSITORY IF NOT EXISTS my_repo_dev WITH PREFIX '$RELEASES/dev';"
+SHOW_VERSION="SELECT 'version=' || extension_version FROM duckdb_extensions() WHERE extension_name = 'rusty_quack';"
+if client both "$BOTH_SQL
+INSTALL rusty_quack FROM my_repo;
+LOAD rusty_quack FROM my_repo;
+$SHOW_VERSION"; then pass 'a client installs the release'; else fail 'a client installs the release' "$(tail -n 3 "$CLIENT_LOG")"; fi
+check_contains 'and gets the tag' "$CLIENT_LOG" 'version=0.6.0'
+if client both "$BOTH_SQL
+FORCE INSTALL rusty_quack FROM my_repo_dev;
+LOAD rusty_quack FROM my_repo_dev;
+$SHOW_VERSION"; then pass 'the same client installs from dev'; else fail 'the same client installs from dev' "$(tail -n 3 "$CLIENT_LOG")"; fi
+check_contains 'and gets the latest commit' "$CLIENT_LOG" 'version=def5678'
+if client both "$BOTH_SQL
+LOAD rusty_quack FROM my_repo;
+$SHOW_VERSION"; then pass 'and can still load the release'; else fail 'and can still load the release' "$(tail -n 3 "$CLIENT_LOG")"; fi
+check_contains 'which is still the tag' "$CLIENT_LOG" 'version=0.6.0'
 
 finish

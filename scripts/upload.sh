@@ -59,6 +59,10 @@ check_key_file() {
 		if ! grep -Fqx -- "$key" <<<"$own_keys"; then dropped=$((dropped + 1)); fi
 	done <<<"$listed"
 	if [ "$dropped" != "0" ]; then
+		# The key file belongs to the whole bucket, and other extensions published there may be signed with what this drops.
+		if ! is_true "$allowed"; then
+			die "The new key file would drop $dropped key(s) from the one in the bucket, which other extensions published there may need. List them in 'additional-public-keys', the same way in every repository that publishes to this bucket. To remove them on purpose, set 'allow-key-change: true'."
+		fi
 		warn "The new key file drops $dropped key(s) from the one in the bucket. New clients won't be able to install objects still signed with them. List them in 'additional-public-keys' until those objects are re-signed."
 	fi
 }
