@@ -20,7 +20,7 @@ mkdir -p "$tmp_dir"
 info "Checking what $repository serves"
 
 fetch() { # <object> <local file>
-	local http_status
+	local http_status encoding=identity
 	case "$repository" in
 	s3://*)
 		read_s3_object "${repository#s3://}/$1" "$2" || {
@@ -30,11 +30,15 @@ fetch() { # <object> <local file>
 		return 0
 		;;
 	esac
-	# Asks for Brotli, because a CDN may otherwise unpack the Wasm objects, which DuckDB-Wasm's browser would never see.
+	# Wasm objects ask for Brotli, because a CDN may otherwise unpack them, which DuckDB-Wasm's browser would never see. The rest
+	# is compared byte for byte, and a CDN may compress a JSON key file for a client that accepts that.
+	case "$1" in
+	*.wasm) encoding=br ;;
+	esac
 	# DuckDB doesn't follow redirects on plain HTTP, so neither does this.
 	case "$repository" in
-	http://*) http_status=$(curl -sS --connect-timeout 30 --max-time 600 --retry 3 -H 'Accept-Encoding: br' -o "$2" -w '%{http_code}' "$repository/$1") || http_status="no response" ;;
-	*) http_status=$(curl -sSL --connect-timeout 30 --max-time 600 --retry 3 -H 'Accept-Encoding: br' -o "$2" -w '%{http_code}' "$repository/$1") || http_status="no response" ;;
+	http://*) http_status=$(curl -sS --connect-timeout 30 --max-time 600 --retry 3 -H "Accept-Encoding: $encoding" -o "$2" -w '%{http_code}' "$repository/$1") || http_status="no response" ;;
+	*) http_status=$(curl -sSL --connect-timeout 30 --max-time 600 --retry 3 -H "Accept-Encoding: $encoding" -o "$2" -w '%{http_code}' "$repository/$1") || http_status="no response" ;;
 	esac
 	if [ "$http_status" != "200" ]; then
 		error "$repository/$1 answered with $http_status, although it has been uploaded. Check that 'repository-url' matches the bucket and 's3-prefix', and that the bucket is public."

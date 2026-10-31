@@ -96,6 +96,9 @@ sign)
 	if [ -z "${INPUT_EXTENSION_NAME:-}" ] && ! is_true "${INPUT_ALL_EXTENSIONS:-false}"; then
 		die "Set 'extension-name' to the extension to sign, or 'all-extensions: true' to sign every extension that's found."
 	fi
+	if [ -n "${INPUT_EXTENSION_NAME:-}" ] && is_true "${INPUT_ALL_EXTENSIONS:-false}"; then
+		die "Set either 'extension-name' or 'all-extensions', not both. Together, they don't say which extensions to sign."
+	fi
 	require_tool openssl
 	require_tool gzip
 	;;
@@ -110,7 +113,7 @@ verify)
 	if [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] || [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
 		die "This job has 'id-token: write', and mode 'verify' runs the extension's native code, which could use it to assume your publishing role. Set 'permissions: {}' on this job, and grant 'id-token: write' only on the publish job."
 	fi
-	for variable in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_PROFILE AWS_SHARED_CREDENTIALS_FILE; do
+	for variable in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_PROFILE AWS_SHARED_CREDENTIALS_FILE AWS_CONFIG_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE; do
 		if [ -n "${!variable:-}" ]; then
 			die "This job has $variable in its environment, and mode 'verify' runs the extension's native code, which could use it to reach your AWS account. Remove it from this job."
 		fi
@@ -127,6 +130,8 @@ publish)
 	[ -n "${INPUT_BUNDLE_DIGEST:-}" ] || die "Input 'bundle-digest' is required in mode 'publish'. Pass the output of the same name from the sign job, which proves that the signed tree hasn't changed since."
 	case "${INPUT_REPOSITORY_URL:-}" in
 	*[[:space:]]*) die "Input 'repository-url' contains whitespace." ;;
+	'' | https://* | http://* | s3://*) ;;
+	*) die "Input 'repository-url' must start with https://, http:// or s3://, got '$INPUT_REPOSITORY_URL'. DuckDB would treat anything else as a local path, so no client could install from it." ;;
 	esac
 	case "${INPUT_S3_ENDPOINT:-}" in
 	http://*) warn "Input 's3-endpoint' uses plain HTTP, which sends everything unencrypted. rclone's AWS provider refuses to upload over it, so use an https:// endpoint." ;;

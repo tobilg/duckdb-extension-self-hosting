@@ -251,9 +251,12 @@ jobs:
       - name: Check that it failed and uploaded nothing
         env:
           OUTCOME: ${{ steps.wrong-digest.outcome }}
+          FILES: ${{ steps.wrong-digest.outputs.files }}
         run: |
           set -x
           test "$OUTCOME" = failure
+          # The summary keeps out everything from the rejected tree, which only happens if the runner says the upload was skipped.
+          test -z "$FILES"
           test "$(curl -s -o /dev/null -w '%{http_code}' "$S3_ENDPOINT/public-bucket/wrong-digest/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz")" = 404
 
       # This stays the last step, because these variables stay for the rest of the job. configure-aws-credentials exports the

@@ -25,6 +25,11 @@ info "Signing key fingerprint: $fingerprint"
 
 # The key file lists the signing key first, then any further keys.
 if [ -n "${INPUT_ADDITIONAL_PUBLIC_KEYS:-}" ]; then
+	# Any other block would be skipped below, and clients would only miss that key when it's time to rotate to it.
+	other_block=$(pem_text "$INPUT_ADDITIONAL_PUBLIC_KEYS" | grep -oE -- '-----BEGIN [A-Z0-9 ]+-----' | grep -vxF -- '-----BEGIN PUBLIC KEY-----' | sed -n 1p || true)
+	if [ -n "$other_block" ]; then
+		die "Input 'additional-public-keys' has a block that can't be used: $other_block. It takes -----BEGIN PUBLIC KEY----- blocks. To convert an RSA public key, run: openssl rsa -RSAPublicKey_in -in key.pub -pubout"
+	fi
 	pem_text "$INPUT_ADDITIONAL_PUBLIC_KEYS" | awk -v dir="$public_dir" '
 		/-----BEGIN PUBLIC KEY-----/ { count++; file = dir "/public_" count ".pem" }
 		file { print > file }

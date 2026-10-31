@@ -26,9 +26,14 @@ openssl pkey -in "$K/pss.pem" -pubout -out "$K/pss.pub" 2>/dev/null
 KEY=$(cat "$K/key.pem")
 
 sign_only() { # <run name> <source dir> [VAR=value...]
-	local name=$1 source_dir=$2
+	local name=$1 source_dir=$2 all=true argument
 	shift 2
-	run_action "$name" INPUT_MODE=sign INPUT_ALL_EXTENSIONS=true INPUT_SIGNING_KEY="$KEY" INPUT_PATH="$source_dir" "$@"
+	for argument in "$@"; do
+		case "$argument" in
+		INPUT_EXTENSION_NAME=*) all=false ;;
+		esac
+	done
+	run_action "$name" INPUT_MODE=sign INPUT_ALL_EXTENSIONS="$all" INPUT_SIGNING_KEY="$KEY" INPUT_PATH="$source_dir" "$@"
 }
 
 # Runs one script of the action with a clean environment, without the steps that action.yml runs after it. Has no
@@ -133,6 +138,14 @@ check_not 'can leave the key file out' test -e "$(output_value signed-dir)/.well
 check_refused 'rejects a 4096-bit reserve key' '2048-bit' sign_only badreserve "$SRC" INPUT_ADDITIONAL_PUBLIC_KEYS="$(cat "$K/big.pub")"
 check_refused 'rejects a reserve key that is not PEM' 'holds no PEM public key' sign_only badreserve2 "$SRC" INPUT_ADDITIONAL_PUBLIC_KEYS="nonsense"
 check_refused 'rejects an RSA-PSS reserve key' 'must be an RSA key' sign_only pssreserve "$SRC" INPUT_ADDITIONAL_PUBLIC_KEYS="$(cat "$K/pss.pub")"
+openssl rsa -in "$K/reserve.pem" -RSAPublicKey_out -out "$K/reserve-rsa.pub" 2>/dev/null
+check_refused 'rejects a reserve key in another format' '-----BEGIN RSA PUBLIC KEY-----' sign_only rsareserve "$SRC" INPUT_ADDITIONAL_PUBLIC_KEYS="$(cat "$K/reserve-rsa.pub")"
+check_contains 'and says how to convert it' "$RUN_LOG" 'openssl rsa -RSAPublicKey_in'
+check_refused 'also after a good one, which used to drop it' '-----BEGIN RSA PUBLIC KEY-----' sign_only mixedreserve "$SRC" INPUT_ADDITIONAL_PUBLIC_KEYS="$(cat "$K/key.pub" "$K/reserve-rsa.pub")"
+openssl rsa -RSAPublicKey_in -in "$K/reserve-rsa.pub" -pubout -out "$K/reserve-converted.pub" 2>/dev/null
+check 'the conversion it suggests gives the same key' cmp "$K/reserve-converted.pub" "$K/reserve.pub"
+check_refused 'rejects a private key by mistake' 'PRIVATE KEY-----' sign_only privatereserve "$SRC" INPUT_ADDITIONAL_PUBLIC_KEYS="$(cat "$K/reserve.pem")"
+check_not_contains 'and does not print it' "$RUN_LOG" "$(sed -n 2p "$K/reserve.pem")"
 RESERVE_ONE_LINE=$(awk '{printf "%s\\n", $0}' "$K/reserve.pub")
 if sign_only literal_reserve "$SRC" INPUT_ADDITIONAL_PUBLIC_KEYS="$RESERVE_ONE_LINE"; then pass 'accepts a reserve key with literal \n'; else fail 'accepts a reserve key with literal \n' "$(tail -n 1 "$RUN_LOG")"; fi
 check_equal 'and lists it' 2 "$(jq '.signature_keys | length' "$(output_value signed-dir)/.well-known/duckdb-extension-repo.json")"
@@ -307,6 +320,7 @@ check 'publishes every platform from one run' test -f "$SIGNED/v2.0.0/osx_arm64/
 check 'all-extensions publishes every extension' test -f "$SIGNED/v2.0.0/linux_amd64/two.duckdb_extension.gz"
 check_refused 'a build tree can not be signed without saying what to sign' 'all-extensions' run_action noname INPUT_MODE=sign INPUT_SIGNING_KEY="$KEY" INPUT_PATH="$M"
 check_refused 'nor can a glob of artifacts' 'all-extensions' run_action nonamepattern INPUT_MODE=sign INPUT_SIGNING_KEY="$KEY" INPUT_ARTIFACT_PATTERN='*'
+check_refused 'extension-name and all-extensions can not be combined, because one would silently win' 'not both' run_action name_and_all INPUT_MODE=sign INPUT_SIGNING_KEY="$KEY" INPUT_PATH="$M" INPUT_EXTENSION_NAME=one INPUT_ALL_EXTENSIONS=true
 run_action named INPUT_MODE=sign INPUT_SIGNING_KEY="$KEY" INPUT_PATH="$M" INPUT_EXTENSION_NAME=one
 SIGNED=$(output_value signed-dir)
 check 'extension-name keeps the named extension' test -f "$SIGNED/v2.0.0/linux_amd64/one.duckdb_extension.gz"
@@ -388,6 +402,12 @@ publish_step() { run_step setup.sh INPUT_MODE=publish INPUT_S3_BUCKET=bucket INP
 check_refused 'publish needs a bucket' "'s3-bucket' is required" run_action nobucket INPUT_MODE=publish INPUT_BUNDLE_DIGEST=abc INPUT_S3_ACCESS_KEY_ID=a INPUT_S3_SECRET_ACCESS_KEY=b
 check_refused 'publish needs the digest of the sign job' "'bundle-digest' is required" run_action nodigest INPUT_MODE=publish INPUT_S3_BUCKET=bucket INPUT_S3_ACCESS_KEY_ID=a INPUT_S3_SECRET_ACCESS_KEY=b
 check_refused 'publish does not take the signing key' "Don't pass 'signing-key'" publish_setup publish_key INPUT_SIGNING_KEY="$KEY" INPUT_S3_ACCESS_KEY_ID=a INPUT_S3_SECRET_ACCESS_KEY=b
+check_refused 'a repository-url without a scheme fails, because clients would read it as a local path' 'must start with' publish_setup no_scheme_url INPUT_REPOSITORY_URL=extensions.example.com
+check_refused 'and one with a scheme nothing here can read' 'must start with' publish_setup other_scheme_url INPUT_REPOSITORY_URL=ftp://extensions.example.com
+for scheme in https://x.example http://x.example s3://bucket/prefix; do
+	check "a repository-url of $scheme is fine" publish_step HAS_S3_ACCESS_KEY_ID=true HAS_S3_SECRET_ACCESS_KEY=true INPUT_REPOSITORY_URL="$scheme"
+done
+check 'and so is none' publish_step HAS_S3_ACCESS_KEY_ID=true HAS_S3_SECRET_ACCESS_KEY=true INPUT_REPOSITORY_URL=
 check_refused 'a repository-url with a line break fails' 'contains whitespace' publish_setup newline_url INPUT_REPOSITORY_URL="$(printf 'https://x\nfingerprint=forged')" INPUT_S3_ACCESS_KEY_ID=a INPUT_S3_SECRET_ACCESS_KEY=b
 check_refused 'no credentials fail before anything else happens' 'No S3 credentials' publish_setup nocreds
 check_not_contains 'and before rclone is downloaded' "$RUN_LOG" 'Installed rclone'
@@ -409,7 +429,7 @@ check 'signing does not mind the permission, because it runs no native code' run
 echo; echo '--- jobs stay apart'
 check_refused 'verify does not take the signing key' "Don't pass 'signing-key'" run_action verify_key INPUT_MODE=verify INPUT_SIGNING_KEY="$KEY"
 check_refused 'verify does not take S3 credentials' "Don't pass S3 credentials" run_action verify_creds INPUT_MODE=verify INPUT_S3_SECRET_ACCESS_KEY=b
-for variable in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_PROFILE AWS_SHARED_CREDENTIALS_FILE; do
+for variable in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_PROFILE AWS_SHARED_CREDENTIALS_FILE AWS_CONFIG_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE; do
 	check_refused "verify refuses $variable in the job" "$variable in its environment" run_action "verify_$variable" INPUT_MODE=verify "$variable=do-not-print"
 	check_not_contains 'and does not print its value' "$RUN_LOG" 'do-not-print'
 done
@@ -578,6 +598,18 @@ TIMEOUT_START=$(date +%s)
 if smoke SMOKE_TEST_TIMEOUT=1; then fail 'stops a CLI that hangs'; else pass 'stops a CLI that hangs'; fi
 if [ "$(($(date +%s) - TIMEOUT_START))" -lt 15 ]; then pass 'without waiting for it'; else fail 'without waiting for it'; fi
 check_contains 'and says it timed out' "$RUN_LOG" 'timed out after 1 seconds'
+# A process the extension left behind keeps the CLI's output open for 20 seconds.
+: >"$RUN_LOG"
+stand_in_cli "$WORK" v2.0.0 "sleep 20 & exec sleep 30"
+TIMEOUT_START=$(date +%s)
+if smoke SMOKE_TEST_TIMEOUT=1; then fail 'stops a hanging CLI that left a process behind'; else pass 'stops a hanging CLI that left a process behind'; fi
+if [ "$(($(date +%s) - TIMEOUT_START))" -lt 15 ]; then pass 'without waiting for that process'; else fail 'without waiting for that process'; fi
+check_contains 'and still says it timed out' "$RUN_LOG" 'timed out after 1 seconds'
+: >"$RUN_LOG"
+stand_in_cli "$WORK" v2.0.0 "sleep 20 & echo 'smoke-test-loaded:true'"
+TIMEOUT_START=$(date +%s)
+if smoke; then pass 'such a process does not fail a CLI that finished'; else fail 'such a process does not fail a CLI that finished' "$(tail -n 2 "$RUN_LOG" | cut -c1-200)"; fi
+if [ "$(($(date +%s) - TIMEOUT_START))" -lt 15 ]; then pass 'or keep the job waiting'; else fail 'or keep the job waiting'; fi
 
 new_step_run smoke_versioned
 run_step setup.sh INPUT_MODE=sign INPUT_ALL_EXTENSIONS=true INPUT_PATH="$S/src" HAS_SIGNING_KEY=true
@@ -795,6 +827,38 @@ upload
 signed_work up_new "$U/v2" "$K/key.pem"
 : >"$RUN_LOG"
 if upload; then pass 'a newer version goes through'; else fail 'a newer version goes through' "$(tail -n 2 "$RUN_LOG")"; fi
+# After a release that only some platforms made, they're on different versions.
+make_extension "$U/v2_mac/demo.duckdb_extension" osx_arm64 v2.0.0 v2.0.0 CPP 3000
+make_extension "$U/v2_linux/demo.duckdb_extension" linux_amd64 v2.0.0 v2.0.0 CPP 3000
+new_bucket mixed_mac
+signed_work mixed_mac_old "$U/v1" "$K/key.pem"
+upload
+signed_work mixed_mac_new "$U/v2_mac" "$K/key.pem"
+upload
+LIVE_MAC=$(sha256_file "$BUCKET/bucket/v2.0.0/osx_arm64/demo.duckdb_extension.gz")
+LIVE_LINUX=$(sha256_file "$BUCKET/bucket/v2.0.0/linux_amd64/demo.duckdb_extension.gz")
+signed_work mixed_mac_rerun "$U/v1" "$K/key.pem"
+check_refused_upload 'an older version is refused on Mac, with Linux on the same version' 'demo for osx_arm64 on DuckDB v2.0.0: v1.0.0 is older than v2.0.0'
+check_equal 'and that latest is unchanged' "$LIVE_MAC" "$(sha256_file "$BUCKET/bucket/v2.0.0/osx_arm64/demo.duckdb_extension.gz")"
+check_equal 'and so is the other one' "$LIVE_LINUX" "$(sha256_file "$BUCKET/bucket/v2.0.0/linux_amd64/demo.duckdb_extension.gz")"
+new_bucket mixed_linux
+signed_work mixed_linux_old "$U/v1" "$K/key.pem"
+upload
+signed_work mixed_linux_new "$U/v2_linux" "$K/key.pem"
+upload
+signed_work mixed_linux_rerun "$U/v1" "$K/key.pem"
+check_refused_upload 'and on Linux, with Mac on the same version' 'demo for linux_amd64 on DuckDB v2.0.0: v1.0.0 is older than v2.0.0'
+new_bucket new_platform_mac
+signed_work new_platform_mac_live "$U/v2_mac" "$K/key.pem"
+upload
+signed_work new_platform_mac_old "$U/v1" "$K/key.pem"
+check_refused_upload 'a platform with no live object does not hide an older version on Mac' 'demo for osx_arm64 on DuckDB v2.0.0: v1.0.0 is older than v2.0.0'
+new_bucket new_platform_linux
+signed_work new_platform_linux_live "$U/v2_linux" "$K/key.pem"
+upload
+signed_work new_platform_linux_old "$U/v1" "$K/key.pem"
+check_refused_upload 'or on Linux' 'demo for linux_amd64 on DuckDB v2.0.0: v1.0.0 is older than v2.0.0'
+check_not 'and uploads nothing' test -e "$BUCKET/bucket/demo/v1.0.0"
 new_bucket hash_version
 make_extension "$U/hash1/demo.duckdb_extension" linux_amd64 v2.0.0 e249224 CPP 3000
 make_extension "$U/hash2/demo.duckdb_extension" linux_amd64 v2.0.0 abcdef0 CPP 3000
@@ -837,8 +901,28 @@ upload
 make_extension "$U/rebuilt/a/demo.duckdb_extension" linux_amd64 v2.0.0 v1.0.0 CPP 3000
 signed_work immutable_two "$U/rebuilt" "$K/key.pem"
 check_refused_upload 'different bytes for a published version are refused' 'overwrite-versioned'
+check_contains 'before anything is uploaded' "$RUN_LOG" 'Nothing has been uploaded'
 : >"$RUN_LOG"
 if upload INPUT_OVERWRITE_VERSIONED=true; then pass 'overwrite-versioned allows it'; else fail 'overwrite-versioned allows it' "$(tail -n 2 "$RUN_LOG")"; fi
+# A new platform in the rebuild has nothing to be refused for, so it used to go live anyway.
+make_extension "$U/v1_linux/demo.duckdb_extension" linux_amd64 v2.0.0 v1.0.0 CPP 3000
+make_extension "$U/rebuilt_more/a/demo.duckdb_extension" linux_amd64 v2.0.0 v1.0.0 CPP 3000
+make_extension "$U/rebuilt_more/b/demo.duckdb_extension" osx_arm64 v2.0.0 v1.0.0 CPP 3000
+new_bucket immutable_new_platform
+signed_work immutable_new_one "$U/v1_linux" "$K/key.pem"
+upload
+signed_work immutable_new_two "$U/rebuilt_more" "$K/key.pem"
+: >"$RCLONE_LOG"
+check_refused_upload 'a rebuild with a new platform is refused too' 'already exists with different content'
+check_not 'and that platform does not go live under that version' test -e "$BUCKET/bucket/demo/v1.0.0/v2.0.0/osx_arm64/demo.duckdb_extension.gz"
+check_not 'or on the latest path' test -e "$BUCKET/bucket/v2.0.0/osx_arm64/demo.duckdb_extension.gz"
+check_equal 'nothing was even tried, only read' '' "$(grep -v '^copyto :s3:' "$RCLONE_LOG")"
+new_bucket immutable_race
+signed_work immutable_race "$U/v1_linux" "$K/key.pem"
+upload
+signed_work immutable_rerun "$U/v1_linux" "$K/key.pem"
+: >"$RUN_LOG"
+if upload; then pass 'signing the same build again goes through the check'; else fail 'signing the same build again goes through the check' "$(tail -n 2 "$RUN_LOG" | cut -c1-200)"; fi
 
 echo; echo '--- checking what the repository serves, with a stand-in rclone'
 new_bucket check
@@ -865,6 +949,62 @@ new_bucket check_prefix
 mkdir -p "$BUCKET/bucket"
 : >"$RUN_LOG"
 check_refused 'a repository-url pointing elsewhere fails' "doesn't exist" check_repository INPUT_REPOSITORY_URL=s3://bucket/elsewhere
+
+echo; echo '--- checking what a CDN serves, with a stand-in curl'
+# Serves the bucket like a CDN: JSON gets compressed for a client that accepts Brotli, and the rest as it is. Logs what each
+# request asked for.
+CDN="$RUNS_DIR/cdn"
+CDN_LOG="$RUNS_DIR/cdn.log"
+mkdir -p "$CDN"
+cat >"$CDN/curl" <<'EOF'
+#!/bin/sh
+output= encoding=none url=
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-o)
+		output=$2
+		shift
+		;;
+	-H)
+		encoding=${2#Accept-Encoding: }
+		shift
+		;;
+	-w | --connect-timeout | --max-time | --retry) shift ;;
+	-*) ;;
+	*) url=$1 ;;
+	esac
+	shift
+done
+object=${url#https://cdn.invalid/}
+printf '%s %s\n' "$object" "$encoding" >>"$FAKE_CDN_LOG"
+if [ ! -f "$FAKE_BUCKET/bucket/$object" ]; then
+	printf 404
+	exit 0
+fi
+case "$object:$encoding" in
+*.json:*br*) printf 'compressed' >"$output" ;;
+*) cp "$FAKE_BUCKET/bucket/$object" "$output" ;;
+esac
+printf 200
+EOF
+chmod +x "$CDN/curl"
+new_bucket check_cdn
+signed_work check_cdn "$U/v1" "$K/key.pem"
+upload
+# A Wasm object, without the brotli that signing one needs.
+mkdir -p "$BUCKET/bucket/v2.0.0/wasm_eh"
+printf 'wasm' >"$BUCKET/bucket/v2.0.0/wasm_eh/demo.duckdb_extension.wasm"
+WASM_DIGEST=$(sha256_file "$BUCKET/bucket/v2.0.0/wasm_eh/demo.duckdb_extension.wasm")
+jq -n -c --arg digest "$WASM_DIGEST" '{object: "v2.0.0/wasm_eh/demo.duckdb_extension.wasm", sha256: $digest, binary_sha256: $digest}' >>"$WORK/bundle/manifest.jsonl"
+: >"$RUN_LOG"
+: >"$CDN_LOG"
+if check_repository PATH="$CDN:$PATH" INPUT_REPOSITORY_URL=https://cdn.invalid FAKE_CDN_LOG="$CDN_LOG"; then pass 'a CDN that compresses JSON passes the check'; else fail 'a CDN that compresses JSON passes the check' "$(tail -n 2 "$RUN_LOG" | cut -c1-200)"; fi
+check_contains 'because the key file asks for it unchanged' "$CDN_LOG" '.well-known/duckdb-extension-repo.json identity'
+check_contains 'like native objects' "$CDN_LOG" 'v2.0.0/linux_amd64/demo.duckdb_extension.gz identity'
+check_contains 'while Wasm objects ask for Brotli, which a CDN must not unpack' "$CDN_LOG" 'v2.0.0/wasm_eh/demo.duckdb_extension.wasm br'
+printf '{"signature_keys":[]}' >"$BUCKET/bucket/.well-known/duckdb-extension-repo.json"
+: >"$RUN_LOG"
+check_refused 'a stale key file still fails through a CDN' 'different key file' check_repository PATH="$CDN:$PATH" INPUT_REPOSITORY_URL=https://cdn.invalid FAKE_CDN_LOG="$CDN_LOG"
 
 echo; echo '--- summary'
 new_step_run summary
@@ -913,6 +1053,28 @@ new_step_run summary_many_step
 run_step summary.sh WORK_DIR="$MANY_WORK" INPUT_S3_BUCKET=bucket INPUT_MODE=publish
 check_contains 'the SQL covers the first extension' "$RUN_SUMMARY" 'INSTALL "alpha" FROM my_repo'
 check_contains 'and the others' "$RUN_SUMMARY" 'LOAD "beta" FROM my_repo'
+sign_only summary_tree "$S/src" INPUT_ADDITIONAL_PUBLIC_KEYS="$(cat "$K/reserve.pub")"
+REFUSED_BUNDLE=$(bundle_dir)
+refused_publish() { # <VAR=value...>
+	run_action summary_refused INPUT_MODE=publish TEST_BUNDLE="$REFUSED_BUNDLE" INPUT_BUNDLE_DIGEST=0000000000000000000000000000000000000000000000000000000000000000 \
+		INPUT_S3_BUCKET=bucket INPUT_S3_ENDPOINT=https://example.invalid INPUT_S3_ACCESS_KEY_ID=key INPUT_S3_SECRET_ACCESS_KEY=secret INPUT_REPOSITORY_URL=https://example.invalid "$@"
+}
+check_refused 'a signed tree that changed is refused' "doesn't match 'bundle-digest'" refused_publish
+check_contains 'and the summary says nothing was published' "$RUN_SUMMARY" '## Nothing was published'
+check_contains 'and that the bucket is unchanged' "$RUN_SUMMARY" 'the bucket is unchanged'
+check_not_contains 'it does not claim a publish' "$RUN_SUMMARY" '## Published DuckDB extensions'
+check_not_contains 'or list the rejected objects' "$RUN_SUMMARY" 'demo.duckdb_extension.gz'
+check_not_contains 'or tell anyone to pin a key from that tree' "$RUN_SUMMARY" 'BEGIN PUBLIC KEY'
+check_not_contains 'or give them SQL' "$RUN_SUMMARY" 'CREATE EXTENSION REPOSITORY'
+check_not_contains 'and no output has that tree in it, neither the files' "$RUN_OUTPUT" 'files<<'
+check_not_contains 'nor the repository' "$RUN_OUTPUT" 'repository-url='
+check_not_contains 'nor the fingerprint' "$RUN_OUTPUT" 'fingerprint='
+new_step_run summary_skipped_other_modes
+run_step summary.sh WORK_DIR="$WORK" INPUT_MODE=verify UPLOAD_OUTCOME=skipped SMOKE_TEST_OUTCOME=success
+check_contains 'a verify job, which never uploads, still reports what it tested' "$RUN_SUMMARY" '## Tested DuckDB extensions'
+: >"$RUN_SUMMARY"
+run_step summary.sh WORK_DIR="$WORK" INPUT_MODE=sign UPLOAD_OUTCOME=skipped
+check_contains 'and a sign job what it signed' "$RUN_SUMMARY" '## Signed DuckDB extensions'
 
 echo; echo '--- verify runners'
 runners_for() { # <JSON object of labels, or empty> <platform...>
@@ -1069,6 +1231,7 @@ check_contains 'and takes the verify runners from the sign job' "$QUICK_START" '
 check_contains 'and passes them on from the sign step' "$QUICK_START" 'verify-runners: ${{ steps.sign.outputs.verify-runners }}'
 check_contains 'and gives the verify job no token' "$QUICK_START" 'permissions: {}'
 check_contains 'and publishes one release at a time' "$QUICK_START" 'cancel-in-progress: false'
+check_equal 'and gives each of its jobs a timeout, because the default is 6 hours' 3 "$(grep -c 'timeout-minutes:' "$QUICK_START")"
 unset_secrets=
 while read -r secret; do
 	grep -q "gh secret set $secret " "$QUICK_START" || unset_secrets="$unset_secrets $secret"

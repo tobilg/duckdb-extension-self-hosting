@@ -68,6 +68,7 @@ Then add these jobs, and replace:
     if: startsWith(github.ref, 'refs/tags/')
     needs: duckdb-stable-build
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     outputs:
       bundle-digest: ${{ steps.sign.outputs.bundle-digest }}
       verify-runners: ${{ steps.sign.outputs.verify-runners }}
@@ -86,6 +87,7 @@ Then add these jobs, and replace:
       matrix:
         os: ${{ fromJSON(needs.sign.outputs.verify-runners) }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     permissions: {}
     steps:
       - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
@@ -95,6 +97,7 @@ Then add these jobs, and replace:
   publish:
     needs: [sign, verify]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     concurrency:
       group: publish-my_ext
       cancel-in-progress: false
@@ -274,14 +277,14 @@ For `mode: sign`:
 | --- | --- | --- |
 | `signing-key` | required | RSA-2048 private key in PEM format, not encrypted. No other mode accepts it. |
 | `extension-name` | | Extension to sign. Selects the artifacts, and skips other extensions found in them. Required unless `all-extensions` is set. |
-| `all-extensions` | `false` | Sign every extension found. Off by default, because a build tree holds more than the one being released. |
+| `all-extensions` | `false` | Sign every extension found. Off by default, because a build tree holds more than the one being released. Can't be combined with `extension-name`. |
 | `artifact-pattern` | `<extension-name>-*-extension-*` | Glob for the workflow artifacts to download |
 | `path` | | Directory that already holds the binaries, for other build systems. Nothing is downloaded. |
 | `exclude-platforms` | | Comma or space separated platforms to skip. Takes `*` and `?`, such as `wasm_*`. A name that can't be a platform fails the run, and an entry that matches nothing gets a warning. |
 | `verify-runner-labels` | | JSON object that replaces the runner for a platform in `verify-runners`, such as `{"osx_arm64": "my-mac-runner"}`. Takes one label each, and only platforms that have a runner. |
 | `duckdb-version` | from the footer | DuckDB version directory with its leading `v`, such as `v2.0.0`, or a comma separated list. Only required for `C_STRUCT` builds. |
 | `extension-version` | from the footer | Version in the versioned path. Also stands in for a footer without a usable version. `duckdb_extensions()` still reports the footer's version, so the run warns if they differ. |
-| `additional-public-keys` | | Further public keys for the key file, such as your reserve key |
+| `additional-public-keys` | | Further public keys for the key file, such as your reserve key, as `-----BEGIN PUBLIC KEY-----` blocks |
 | `upload-latest` | `true` | Include the path `INSTALL` reads |
 | `upload-versioned` | `true` | Include the path `INSTALL ... VERSION` reads |
 | `publish-key-file` | `true` | Include `.well-known/duckdb-extension-repo.json`, which `CREATE` reads when a client [doesn't pass a key](#pinning-the-key) |
@@ -306,7 +309,7 @@ For `mode: publish`:
 | `overwrite-versioned` | `false` | Allow replacing a versioned object with different bytes |
 | `allow-key-change` | `false` | Allow a signing key that isn't in the bucket's key file, for a [rotation](#rotating-keys) |
 | `allow-downgrade` | `false` | Allow moving the latest path to a lower version |
-| `repository-url` | `s3://<bucket>/<prefix>` | Public prefix clients use |
+| `repository-url` | `s3://<bucket>/<prefix>` | Public prefix clients use. Has to start with `https://`, `http://` or `s3://`. |
 | `check-repository` | `true` | Read every object back through `repository-url` and compare the bytes |
 
 ## Outputs
@@ -437,6 +440,8 @@ After the upload, the publish job reads every object and the key file back throu
 If the upload itself fails partway, the summary and `uploaded-objects` list what went live. Re-run the job to finish it.
 
 Two publish jobs at the same time can still get past the version check, because it isn't atomic on S3. That's why the workflow above has a `concurrency` group: use one for every extension.
+
+By default, GitHub only keeps one job waiting per group. So if you push three tags in quick succession, the second one's publish job is cancelled, and that version isn't published. Re-running it after a newer tag went live gets refused as a lower version. GitHub's [`queue: max`](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax) setting keeps every job waiting instead.
 
 ## Publishing to AWS with OIDC
 

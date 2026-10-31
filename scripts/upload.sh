@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Uploads the signed tree: versioned paths, then the key file, then latest paths. That way a refused versioned upload
 # leaves the key file and latest untouched, and a client that sees a new latest object can already fetch what it refers to.
-# Before any of that it stops a release that would change the signing key or move latest back by accident, because the signed
-# tree alone can't show either.
+# Before any of that it stops a release that would change the signing key, move latest back by accident or change a published
+# version, because the signed tree alone can't show any of them.
 
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -63,42 +63,72 @@ check_key_file() {
 	fi
 }
 
-# Re-running an older release, or two tags pushed out of order, would otherwise move every client back. The footer of what's
-# live is the only reliable record of its version, so this reads one object per extension and DuckDB version.
+check_live_version() { # <index> <object> <kind> <name> <duckdb version> <platform> <new version>
+	local existing="$tmp_dir/existing-$1" object=$2 kind=$3 name=$4 duckdb_version=$5 platform=$6 new_version=$7 size old_version
+	[ -n "$new_version" ] || return 0
+	read_s3_object "$destination/$object" "$existing.packed" || return 0
+	if [ "$kind" = "wasm" ]; then
+		if ! command -v brotli >/dev/null 2>&1; then
+			warn "Can't compare $object with what's live, because brotli isn't installed."
+			return 0
+		fi
+		if ! brotli -d -c "$existing.packed" >"$existing"; then
+			warn "Can't compare $object with what's live, because it isn't valid Brotli."
+			return 0
+		fi
+	elif ! gunzip -c "$existing.packed" >"$existing" 2>/dev/null; then
+		warn "Can't compare $object with what's live, because it isn't valid gzip."
+		return 0
+	fi
+	size=$(file_size "$existing")
+	[ "$size" -ge 512 ] || return 0
+	old_version=$(footer_field "$existing" "$size" 384)
+	case "$(compare_versions "$new_version" "$old_version")" in
+	lt) die "$name for $platform on DuckDB $duckdb_version: $new_version is older than $old_version, which clients get now. Set 'allow-downgrade: true' if that's what you want." ;;
+	unknown)
+		if [ "$new_version" != "$old_version" ]; then
+			notice "$name for $platform on DuckDB $duckdb_version: can't tell whether $new_version is newer than $old_version, because they aren't both major.minor.patch versions."
+		fi
+		;;
+	esac
+}
+
+# Re-running an older release, or two tags pushed out of order, would otherwise move clients back. The footer of what's live is
+# the only reliable record of its version. This reads every platform, because they can be on different versions after a release
+# that only some of them made, and a platform with no live object says nothing about the others.
 check_downgrade() {
 	if is_true "${INPUT_ALLOW_DOWNGRADE:-false}"; then return 0; fi
-	local object kind name duckdb_version new_version existing="$tmp_dir/existing" size old_version
-	jq -s -r 'map(select(.channel == "latest")) | group_by([.name, .duckdb_version]) | map(first)
-		| .[] | [.object, .kind, .name, .duckdb_version, .footer_extension_version] | @tsv' "$manifest" >"$tmp_dir/latest-samples"
-	while IFS="$tab" read -r object kind name duckdb_version new_version; do
-		[ -n "$new_version" ] || continue
-		read_s3_object "$destination/$object" "$existing.packed" || continue
-		if [ "$kind" = "wasm" ]; then
-			if ! command -v brotli >/dev/null 2>&1; then
-				warn "Can't compare $object with what's live, because brotli isn't installed."
-				continue
-			fi
-			if ! brotli -d -c "$existing.packed" >"$existing"; then
-				warn "Can't compare $object with what's live, because it isn't valid Brotli."
-				continue
-			fi
-		elif ! gunzip -c "$existing.packed" >"$existing" 2>/dev/null; then
-			warn "Can't compare $object with what's live, because it isn't valid gzip."
-			continue
-		fi
-		size=$(file_size "$existing")
-		[ "$size" -ge 512 ] || continue
-		old_version=$(footer_field "$existing" "$size" 384)
-		case "$(compare_versions "$new_version" "$old_version")" in
-		lt) die "$name on DuckDB $duckdb_version: $new_version is older than $old_version, which clients get now. Set 'allow-downgrade: true' if that's what you want." ;;
-		unknown)
-			if [ "$new_version" != "$old_version" ]; then
-				notice "$name on DuckDB $duckdb_version: can't tell whether $new_version is newer than $old_version, because they aren't both major.minor.patch versions."
-			fi
-			;;
-		esac
-	done <"$tmp_dir/latest-samples"
-	rm -f "$existing" "$existing.packed"
+	local index=0 object kind name duckdb_version platform new_version
+	jq -r 'select(.channel == "latest") | [.object, .kind, .name, .duckdb_version, .platform, .footer_extension_version] | @tsv' "$manifest" >"$tmp_dir/live-versions"
+	while IFS="$tab" read -r object kind name duckdb_version platform new_version; do
+		index=$((index + 1))
+		pool_start "$upload_jobs" check_live_version "$index" "$object" "$kind" "$name" "$duckdb_version" "$platform" "$new_version"
+	done <"$tmp_dir/live-versions"
+	pool_wait
+	[ "$pool_failed" = "0" ] || exit 1
+	rm -f "$tmp_dir"/existing-*
+}
+
+check_versioned_object() { # <index> <object>
+	local existing="$tmp_dir/existing-$1"
+	read_s3_object "$destination/$2" "$existing" || return 0
+	if ! cmp -s "$existing" "$signed_dir/$2"; then
+		die "$2 already exists with different content. Nothing has been uploaded. Publish a new extension version, or set 'overwrite-versioned: true' to replace it."
+	fi
+}
+
+# A refused release has to stop here. --immutable only refuses object by object, so by then its other platforms would already
+# be live under that version, and could never change either. --immutable stays, for a release that gets there in between.
+check_versioned_objects() {
+	if is_true "${INPUT_OVERWRITE_VERSIONED:-false}"; then return 0; fi
+	local index=0 object
+	while IFS= read -r object; do
+		index=$((index + 1))
+		pool_start "$upload_jobs" check_versioned_object "$index" "$object"
+	done <"$tmp_dir/versioned"
+	pool_wait
+	[ "$pool_failed" = "0" ] || exit 1
+	rm -f "$tmp_dir"/existing-*
 }
 
 # --checksum compares content, not modification time: a re-run produces identical bytes and uploads nothing.
@@ -134,8 +164,9 @@ upload_versioned_object() { # <object>
 
 check_key_file
 check_downgrade
-
 jq -r 'select(.channel == "versioned") | .object' "$manifest" >"$tmp_dir/versioned"
+check_versioned_objects
+
 while IFS= read -r object; do
 	pool_start "$upload_jobs" upload_versioned_object "$object"
 done <"$tmp_dir/versioned"

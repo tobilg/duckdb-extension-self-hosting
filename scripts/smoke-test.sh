@@ -120,7 +120,10 @@ EOF
 
 	info "Smoke test: $name on DuckDB $version"
 	cli_status=0
-	output=$(run_with_timeout "$timeout_seconds" "$sql_file" "${cli_env[@]}" HOME="$home_dir" "$duckdb_cli" -batch -bail -noheader -list 2>&1) || cli_status=$?
+	# To a file, because a command substitution would also wait for any process the extension left behind with the CLI's output
+	# open, long past the timeout.
+	run_with_timeout "$timeout_seconds" "$sql_file" "${cli_env[@]}" HOME="$home_dir" "$duckdb_cli" -batch -bail -noheader -list >"$WORK_DIR/tmp/smoke-output" 2>&1 || cli_status=$?
+	output=$(cat "$WORK_DIR/tmp/smoke-output")
 	case "$cli_status" in
 	0)
 		if [[ "$output" != *smoke-test-loaded:true* ]]; then

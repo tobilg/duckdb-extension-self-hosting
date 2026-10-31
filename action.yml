@@ -19,7 +19,7 @@ inputs:
     description: Extension to sign. Selects the build artifacts, and skips any other extension found in them.
     required: false
   all-extensions:
-    description: Sign every extension found in 'path' or 'artifact-pattern', instead of only 'extension-name'.
+    description: Sign every extension found in 'path' or 'artifact-pattern'. Can't be combined with 'extension-name'.
     required: false
     default: 'false'
   artifact-pattern:
@@ -105,7 +105,7 @@ inputs:
     required: false
     default: 'false'
   repository-url:
-    description: Public prefix clients use, such as https://extensions.example.com. Without it, the check and summary use s3://<bucket>/<prefix>.
+    description: Public prefix clients use, such as https://extensions.example.com. Has to start with https://, http:// or s3://. Without it, the check and summary use s3://<bucket>/<prefix>.
     required: false
   check-repository:
     description: After uploading, read every object back through repository-url and compare the bytes. Runs no downloaded code.

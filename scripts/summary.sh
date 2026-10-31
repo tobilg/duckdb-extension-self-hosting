@@ -10,6 +10,13 @@ verified="$WORK_DIR/verified"
 uploaded="$WORK_DIR/uploaded"
 mode=${INPUT_MODE:-}
 
+# The upload never started, so the bucket is unchanged. The signed tree may be the one that was just rejected, so nothing from
+# it belongs here, least of all a public key for clients to pin.
+if [ "$mode" = "publish" ] && [ "${UPLOAD_OUTCOME:-}" = "skipped" ]; then
+	printf '## Nothing was published\n\n> **The job stopped before the upload**, so the bucket is unchanged. See the log of this run.\n' >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
+	exit 0
+fi
+
 # Signing failed, or the signed tree never arrived, so there's nothing to report.
 [ -s "$manifest" ] || exit 0
 
