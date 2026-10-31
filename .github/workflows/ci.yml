@@ -38,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os: [ubuntu-24.04, macos-26]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -88,6 +88,7 @@ jobs:
           } >>"$GITHUB_ENV"
           source tests/lib.sh
           fetch_fixture community v2.0.0/linux_amd64/rusty_quack.duckdb_extension "$RUNNER_TEMP/binaries/linux/rusty_quack.duckdb_extension"
+          fetch_fixture community v2.0.0/linux_arm64/rusty_quack.duckdb_extension "$RUNNER_TEMP/binaries/linux-arm/rusty_quack.duckdb_extension"
           fetch_fixture community v2.0.0/osx_arm64/rusty_quack.duckdb_extension "$RUNNER_TEMP/binaries/mac/rusty_quack.duckdb_extension"
 
       - name: Sign
@@ -112,7 +113,7 @@ jobs:
           [[ "$DIGEST" =~ ^[0-9a-f]{64}$ ]]
           test -f "$SIGNED_DIR/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz"
           test -f "$SIGNED_DIR/.well-known/duckdb-extension-repo.json"
-          test "$(jq 'length' <<<"$FILES")" = 4
+          test "$(jq 'length' <<<"$FILES")" = 6
           test "$(jq -r '.[0].name' <<<"$FILES")" = rusty_quack
 
       - name: An empty signing key fails
@@ -135,7 +136,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -172,7 +173,7 @@ jobs:
         run: |
           set -x
           test "$OUTCOME" = failure
-          test "$(jq 'length' <<<"$FILES")" = 4
+          test "$(jq 'length' <<<"$FILES")" = 6
 
   action-publish:
     name: Run the publish job through uses
@@ -209,8 +210,8 @@ jobs:
           set -x
           [[ "$FINGERPRINT" =~ ^sha256:[0-9a-f]{64}$ ]]
           test "$REPOSITORY_URL" = "$S3_ENDPOINT/public-bucket/repo"
-          test "$(jq 'length' <<<"$FILES")" = 4
-          test "$(jq 'length' <<<"$UPLOADED")" = 5
+          test "$(jq 'length' <<<"$FILES")" = 6
+          test "$(jq 'length' <<<"$UPLOADED")" = 7
           curl -fsS -o /dev/null "$REPOSITORY_URL/v2.0.0/linux_amd64/rusty_quack.duckdb_extension.gz"
           curl -fsS -o /dev/null "$REPOSITORY_URL/.well-known/duckdb-extension-repo.json"
 
@@ -276,7 +277,7 @@ jobs:
           UPLOADED: ${{ steps.publish-role.outputs.uploaded-objects }}
         run: |
           set -x
-          test "$(jq 'length' <<<"$UPLOADED")" = 5
+          test "$(jq 'length' <<<"$UPLOADED")" = 7
 
   action-oidc-guard:
     name: Refuse to run native code in a job that can request an OIDC token
