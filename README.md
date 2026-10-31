@@ -120,7 +120,7 @@ Merge that, then push a tag:
 git tag 1.0.0 && git push origin 1.0.0
 ```
 
-The tag has to be on a commit that has these jobs, because GitHub runs the workflow from the tagged commit. DuckDB's build uses the tag as the extension's version. Most builds [only load in the DuckDB version they were built for](#what-ends-up-in-the-bucket), so tag a new release for each DuckDB version too.
+The tag has to be on a commit that has these jobs, because GitHub runs the workflow from the tagged commit. DuckDB's build uses the tag as the extension's version. Most builds [only load in the DuckDB version they were built for](#what-ends-up-in-the-bucket), so tag a new release for each DuckDB version too. To also publish every push to `main`, see [Publishing every push to main](#publishing-every-push-to-main).
 
 ### 5. Install it
 
@@ -371,6 +371,56 @@ Upstream's tests are your extension's own SQL tests, run in the build job as of 
 - **Other runners:** set `verify-runner-labels` on the sign job, for a self-hosted runner, or for a newer image before this action moves to it.
 - **A matrix by hand:** this still works, but nothing warns you if it misses a platform.
 - **`allow_failure_archs`:** a failed build just isn't in the signed tree. The release goes out without that platform, and its latest path keeps the previous build.
+
+## Publishing every push to main
+
+The [Quick start](#3-add-the-jobs) only publishes tags. To also publish every push to `main`, change these lines in its jobs, which send those builds to a separate `dev` path:
+
+```yaml
+  sign:
+    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main')
+    # ...
+    steps:
+      - id: sign
+        uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+        with:
+          # ...
+          upload-versioned: ${{ startsWith(github.ref, 'refs/tags/') }}
+
+  publish:
+    # ...
+    steps:
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+        with:
+          # ...
+          s3-prefix: ${{ !startsWith(github.ref, 'refs/tags/') && 'dev' || '' }}
+          repository-url: ${{ startsWith(github.ref, 'refs/tags/') && 'https://extensions.example.com' || 'https://extensions.example.com/dev' }}
+```
+
+Keep the `s3-prefix` condition in that order. GitHub treats `''` as false, so `x && '' || 'dev'` would always give `dev`.
+
+Clients that want these builds add a second repository, and run `FORCE INSTALL` to move to a newer one:
+
+```sql
+SET allow_extension_repositories = 'allowed';
+CREATE EXTENSION REPOSITORY IF NOT EXISTS my_repo_dev
+    WITH PREFIX 'https://extensions.example.com/dev';
+INSTALL my_ext FROM my_repo_dev;
+LOAD my_ext FROM my_repo_dev;
+```
+
+A build without a tag has a commit hash as its version, which is why these go elsewhere:
+
+- **On the same path, they replace your releases.** `INSTALL` would get the latest commit instead of the latest tag.
+- **Hashes can't be ordered.** After a hash on the latest path, the [check for a lower version](#what-stops-a-release) only leaves a notice, so an older tag can go live until the next newer one.
+- **Rebuilding a commit gives different bytes.** A versioned path would refuse that, so these builds only get the latest path.
+
+Publishing this way also changes a few things:
+
+- **Every push gets signed with no manual step,** so a bad merge or a compromised dependency gets signed too. If that's a concern, use a [separate key](#signing-keys) for `dev`, so that clients of your tagged releases don't trust those builds.
+- **Two quick pushes can finish out of order.** The older build can then land last, and nothing catches that.
+- **Environments need to allow it.** A rule that only allows tags has to allow `main` too.
+- **Each push adds the verify runners.** That's free on public repositories, but counts against your budget on private ones.
 
 ## What stops a release
 

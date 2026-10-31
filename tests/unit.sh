@@ -1076,6 +1076,14 @@ done <<EOF
 $(grep -oE 'secrets\.[A-Z0-9_]+' "$QUICK_START" | sed 's/secrets\.//' | sort -u)
 EOF
 check_equal 'and sets every secret its jobs read' '' "$unset_secrets"
+MAIN_PUSHES="$RUNS_DIR/main-pushes.md"
+sed -n '/^## Publishing every push to main/,/^## What stops a release/p' "$TESTS_ROOT/README.md" >"$MAIN_PUSHES"
+check_contains 'the README shows how to publish pushes to main' "$MAIN_PUSHES" "github.ref == 'refs/heads/main'"
+check_contains 'not on a manual run' "$MAIN_PUSHES" "github.event_name == 'push'"
+check_contains 'without a versioned path, which a rebuild can not replace' "$MAIN_PUSHES" "upload-versioned: \${{ startsWith(github.ref, 'refs/tags/') }}"
+check_contains 'on a path of their own' "$MAIN_PUSHES" "s3-prefix: \${{ !startsWith(github.ref, 'refs/tags/') && 'dev' || '' }}"
+check_contains 'which clients of that path read back' "$MAIN_PUSHES" "'https://extensions.example.com/dev' }}"
+check_not 'with no condition that always picks one side, because an empty string is false' grep -qE "^ +[a-z0-9-]+: .*&& '' \|\|" "$MAIN_PUSHES"
 check_contains 'CI checks that verify is skipped with sign, which the quick start relies on' "$TESTS_ROOT/.github/workflows/ci.yml" 'os: ${{ fromJSON(needs.no-tag-sign.outputs.verify-runners) }}'
 check_contains 'CI takes the verify runners from the sign job, so a real run proves it' "$TESTS_ROOT/.github/workflows/ci.yml" 'os: ${{ fromJSON(needs.action-sign.outputs.verify-runners) }}'
 RUNNER_MAP=$(lib_call 'printf "%s" "$VERIFY_RUNNERS"' | jq -r 'to_entries[] | "\(.key) \(.value)"')
