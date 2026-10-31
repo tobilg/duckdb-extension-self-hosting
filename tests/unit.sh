@@ -1000,8 +1000,13 @@ check_equal 'the role check only grants id-token to the publish job' 'publish ' 
 AWS_ACTION_PIN=$(grep -oE 'aws-actions/configure-aws-credentials@[0-9a-f]{40}' "$OIDC_EXAMPLE" | sort -u)
 check 'the OIDC example pins the AWS action by commit' test -n "$AWS_ACTION_PIN"
 check_equal 'and the README pins the same commit' "$AWS_ACTION_PIN" "$(grep -oE 'aws-actions/configure-aws-credentials@[0-9a-f]{40}' "$TESTS_ROOT/README.md" | sort -u)"
+VERIFY_RUNNERS='os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]'
+check_contains 'CI runs the verify job on the runners the examples list' "$TESTS_ROOT/.github/workflows/ci.yml" "$VERIFY_RUNNERS"
 for example in "$TESTS_ROOT/examples/release.yml" "$OIDC_EXAMPLE" "$TESTS_ROOT/README.md"; do
 	name=$(basename "$example")
+	check_contains "$name tests every platform built by default that has a runner" "$example" "$VERIFY_RUNNERS"
+	check_contains "$name says how to add Intel Macs" "$example" 'opt_in_archs: osx_amd64'
+	check_contains "$name names the Intel runner" "$example" 'macos-26-intel'
 	check_contains "$name sets a concurrency group for publishing" "$example" 'cancel-in-progress: false'
 	check_contains "$name sets a timeout" "$example" 'timeout-minutes:'
 	check_contains "$name passes the digest to the publish job" "$example" 'bundle-digest: ${{ needs.sign.outputs.bundle-digest }}'

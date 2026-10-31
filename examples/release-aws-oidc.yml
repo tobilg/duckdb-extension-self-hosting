@@ -38,13 +38,14 @@ jobs:
           additional-public-keys: ${{ vars.EXTENSION_RESERVE_PUBLIC_KEY }}
 
   # Runs your extension's code, so it has no secrets at all, and can't request a token for your role.
-  # Each runner tests its own platform, so add every type you can.
+  # A runner can only test its own platform, so these cover Linux on x86 and Arm, and macOS on Apple Silicon. For Intel Macs,
+  # add macos-26-intel here and opt_in_archs: osx_amd64 to the build job.
   verify:
     needs: sign
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions: {}

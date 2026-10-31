@@ -35,7 +35,7 @@ Create a second key the same way and keep it offline. Pinning both from the star
 | `EXTENSION_SIGNING_KEY` | Contents of `signing_key.pem` |
 | `EXTENSION_RESERVE_PUBLIC_KEY` | Contents of the second key's `.pub` file. A variable, because it's public. |
 | `S3_ENDPOINT` | Your store's S3 API, such as `https://<account_id>.r2.cloudflarestorage.com`. Leave out the input on AWS. |
-| `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | A token that can read, write and list the bucket's objects. On AWS, that's `s3:GetObject`, `s3:PutObject` and `s3:ListBucket`. |
+| `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | A token that can read, write and list the bucket's objects. On AWS, that's `s3:GetObject`, `s3:PutObject`, `s3:AbortMultipartUpload` and `s3:ListBucket`. |
 
 Prefer [environment secrets](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments) with required reviewers, one environment for the key and another for the storage credentials, so that each is only available to the job that needs it. On AWS, you can [use OIDC](#publishing-to-aws-with-oidc) instead of the two S3 secrets and `S3_ENDPOINT`.
 
@@ -80,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions: {}
@@ -109,7 +109,20 @@ jobs:
           repository-url: https://extensions.example.com
 ```
 
-One Linux job signs and publishes the binaries of every platform. Each `verify` runner can only test its own platform, so list every type of runner you can. [`examples/release.yml`](examples/release.yml) has a commented version.
+One Linux job signs and publishes the binaries of every platform, but a `verify` runner can only load the build for its own. The matrix above tests every platform that's built by default and has a runner:
+
+| Platform | Built by default | Load-tested on |
+| --- | --- | --- |
+| `linux_amd64` | Yes | `ubuntu-24.04` |
+| `linux_arm64` | Yes | `ubuntu-24.04-arm` |
+| `osx_arm64` (Apple Silicon) | Yes | `macos-26` |
+| `osx_amd64` (Intel) | No | `macos-26-intel`, once you add it |
+| `windows_amd64`, `windows_amd64_mingw`, `wasm_*` | Yes | Nothing |
+| `windows_arm64`, `linux_amd64_musl`, `linux_arm64_musl` | No | Nothing |
+
+For Intel Macs, add `opt_in_archs: osx_amd64` to the build job and `macos-26-intel` to the matrix.
+
+A platform that nothing tests is still signed and published, so test it yourself or leave it out with `exclude-platforms`. This action doesn't run on Windows, GitHub has no musl runners, and Wasm has [its own notes](#duckdb-wasm). [`examples/release.yml`](examples/release.yml) has a commented version of the workflow.
 
 ### 4. Install it
 
@@ -204,7 +217,7 @@ A new DuckDB release means new objects, depending on the ABI type:
 
 Each of these fails the run before anything is uploaded:
 
-- **A build that doesn't load.** The verify jobs run first, and `publish` has `needs` on them. A failure there leaves the bucket as it was, so `latest` keeps working and the version number stays free for a fixed build.
+- **A build that doesn't load.** The verify jobs run first, and `publish` has `needs` on them. A failure there leaves the bucket as it was, so `latest` keeps working and the version number stays free for a fixed build. This only covers [the platforms your matrix tests](#3-add-the-workflow).
 - **A signed tree that changed.** `bundle-digest` comes from the sign job through GitHub's job outputs, which the verify job can't touch.
 - **A signing key clients don't know.** If the bucket has a key file and doesn't list the signing key, clients that pinned those keys would reject the release. This catches a wrong secret. A rotation sets `allow-key-change`.
 - **A lower version on the latest path.** This catches an older tag re-run after a newer one. It compares major.minor.patch with what's live, and only leaves a notice if a version isn't in that form, like a commit hash. Deliberate rollbacks set `allow-downgrade`.
