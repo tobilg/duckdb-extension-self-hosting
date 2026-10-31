@@ -12,7 +12,7 @@ It runs after DuckDB's standard build, in three jobs:
 
 The jobs are separate because `verify` runs your extension's native code, and a step can read every secret its job has. See [Security](#security).
 
-> **Status:** pre-release, and DuckDB's docs mark custom repositories as work in progress. It's tested against a local S3-compatible store (SeaweedFS). A release from a real extension to Cloudflare R2 is still open, and `v1` follows once that has passed.
+> **Status:** DuckDB's docs mark custom repositories as work in progress. This action is tested against a local S3-compatible store (SeaweedFS), and with real releases to Cloudflare R2.
 
 ## Quick start
 
