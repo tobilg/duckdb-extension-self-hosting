@@ -40,10 +40,14 @@ fetch_url() { # <object> <local file>: prints the HTTP status
 }
 
 fetch() { # <object> <local file>
-	local http_status announced=false
+	local http_status announced=false read=read_s3_object
 	case "$repository" in
 	s3://*)
-		read_s3_object "${repository#s3://}/$1" "$2" || {
+		# check_object compares a Wasm object in either form.
+		case "$1" in
+		*.wasm) read=read_s3_wasm_object ;;
+		esac
+		"$read" "${repository#s3://}/$1" "$2" || {
 			error "$repository/$1 doesn't exist, although it has been uploaded. Check that 'repository-url' matches the bucket and 's3-prefix'."
 			return 1
 		}

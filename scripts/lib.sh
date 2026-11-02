@@ -326,10 +326,42 @@ rclone_s3() { # <rclone arguments...>
 	"$WORK_DIR/bin/rclone" "$@" "${flags[@]}"
 }
 
+# The reason rclone gives in its log for the failure of a command, without the time and level in front.
+rclone_error() { # <log file>
+	local line
+	line=$(grep -E 'Failed to [a-z]+:|ERROR' "$1" | tail -n 1 || true)
+	[ -n "$line" ] || line=$(sed '/^[[:space:]]*$/d' "$1" | tail -n 1 || true)
+	printf '%s' "$line" | sed -E 's/^[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9:]{8} [A-Z]+ *: //; s/^Failed to [a-z]+: //; s/^Attempt [0-9]+\/[0-9]+ failed with [0-9]+ errors and: //'
+}
+
 # Downloads an object, and returns 1 if it doesn't exist. rclone reports a missing object as success and writes no file, so
-# only its other failures are errors.
-read_s3_object() { # <bucket and key> <local file>
-	rm -f "$2"
-	rclone_s3 copyto ":s3:$1" "$2" </dev/null || die "Couldn't read $1 from the bucket. Check the credentials, and that they can read and list its objects."
-	[ -f "$2" ]
+# only its other failures are errors. Extra arguments go to rclone.
+read_s3_object() { # <bucket and key> <local file> [rclone arguments...]
+	local object=$1 file=$2 log="$2.rclone-log" reason hint=
+	shift 2
+	rm -f "$file"
+	if ! rclone_s3 copyto ":s3:$object" "$file" "$@" </dev/null 2>"$log"; then
+		cat "$log" >&2
+		reason=$(rclone_error "$log")
+		rm -f "$log"
+		if grep -Eiq 'StatusCode: 40[13]|AccessDenied|Forbidden|InvalidAccessKeyId|SignatureDoesNotMatch|ExpiredToken|InvalidToken|credential' <<<"$reason"; then
+			hint=' Check the credentials, and that they can read and list its objects.'
+		fi
+		die "Couldn't read $object from the bucket: ${reason:-rclone failed without saying why}.$hint"
+	fi
+	cat "$log" >&2
+	rm -f "$log"
+	[ -f "$file" ]
+}
+
+# Downloads a Wasm object, which comes back in either form: R2 unpacks an object stored with a Content-Encoding unless its
+# Cache-Control has no-transform, and those uploaded by v1.0.0 of this action don't. The unpacked bytes don't match the size
+# and hash the bucket lists, so rclone can't check them here. Callers check the content instead.
+read_s3_wasm_object() { # <bucket and key> <local file>
+	read_s3_object "$1" "$2" --ignore-size --ignore-checksum --multi-thread-streams=0
+}
+
+# Whether a file starts with the Wasm magic number, \0asm, rather than being Brotli-compressed.
+is_wasm_binary() { # <file>
+	[ "$(head -c 4 "$1" | od -An -tx1 | tr -d ' \n')" = "0061736d" ]
 }

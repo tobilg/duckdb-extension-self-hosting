@@ -74,7 +74,7 @@ Then add these jobs, and replace:
       verify-runners: ${{ steps.sign.outputs.verify-runners }}
     steps:
       - id: sign
-        uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+        uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.1
         with:
           mode: sign
           extension-name: my_ext
@@ -90,7 +90,7 @@ Then add these jobs, and replace:
     timeout-minutes: 30
     permissions: {}
     steps:
-      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.1
         with:
           mode: verify
 
@@ -102,7 +102,7 @@ Then add these jobs, and replace:
       group: publish-my_ext
       cancel-in-progress: false
     steps:
-      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.1
         with:
           mode: publish
           bundle-digest: ${{ needs.sign.outputs.bundle-digest }}
@@ -209,7 +209,7 @@ jobs:
       verify-runners: ${{ steps.sign.outputs.verify-runners }}
     steps:
       - id: sign
-        uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+        uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.1
         with:
           mode: sign
           extension-name: my_ext
@@ -226,7 +226,7 @@ jobs:
     timeout-minutes: 30
     permissions: {}
     steps:
-      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.1
         with:
           mode: verify
 
@@ -239,7 +239,7 @@ jobs:
       group: publish-my_ext
       cancel-in-progress: false
     steps:
-      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.1
         with:
           mode: publish
           bundle-digest: ${{ needs.sign.outputs.bundle-digest }}
@@ -407,7 +407,7 @@ These jobs take the place of the Quick start's. Make the [same replacements](#3-
       verify-runners: ${{ steps.sign.outputs.verify-runners }}
     steps:
       - id: sign
-        uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+        uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.1
         with:
           mode: sign
           extension-name: my_ext
@@ -424,7 +424,7 @@ These jobs take the place of the Quick start's. Make the [same replacements](#3-
     timeout-minutes: 30
     permissions: {}
     steps:
-      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.1
         with:
           mode: verify
 
@@ -436,7 +436,7 @@ These jobs take the place of the Quick start's. Make the [same replacements](#3-
       group: publish-my_ext
       cancel-in-progress: false
     steps:
-      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.1
         with:
           mode: publish
           bundle-digest: ${{ needs.sign.outputs.bundle-digest }}
@@ -603,7 +603,7 @@ publish:
       with:
         role-to-assume: arn:aws:iam::<account_id>:role/extension-publisher
         aws-region: <bucket-region>
-    - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+    - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.1
       with:
         mode: publish
         bundle-digest: ${{ needs.sign.outputs.bundle-digest }}
@@ -626,7 +626,7 @@ Clients only send `HEAD` and `GET`, so a public bucket can be served from any HT
 
 On Cloudflare R2, use a custom domain. Cloudflare says public access through `r2.dev` ["is rate-limited and should only be used for development purposes"](https://developers.cloudflare.com/r2/buckets/public-buckets/).
 
-Custom domains go through Cloudflare's cache, which [keeps `.gz` files for 2 hours by default](https://developers.cloudflare.com/cache/concepts/default-cache-behavior/). The latest paths keep their names between releases, so the action stores `Cache-Control: no-cache` on them and on the key file, and `public, max-age=86400` on versioned objects. A Cache Rule of your own can override that. If a client could still get an old copy, the check after the upload fails with a "different build" error, and you can purge the path. After `overwrite-versioned`, purge the versioned path too.
+Custom domains go through Cloudflare's cache, which [keeps `.gz` files for 2 hours by default](https://developers.cloudflare.com/cache/concepts/default-cache-behavior/). The latest paths keep their names between releases, so the action stores `Cache-Control: no-cache` on them and on the key file (`no-cache, no-transform` on [Wasm objects](#duckdb-wasm)), and `public, max-age=86400` on versioned objects. A Cache Rule of your own can override that. If a client could still get an old copy, the check after the upload fails with a "different build" error, and you can purge the path. After `overwrite-versioned`, purge the versioned path too.
 
 Three more things to know about that cache:
 
@@ -636,7 +636,7 @@ Three more things to know about that cache:
 
 ## Security
 
-- **Pin the action by commit.** It handles your signing key: `uses: tobilg/duckdb-extension-self-hosting@<sha> # v1.0.0`.
+- **Pin the action by commit.** It handles your signing key: `uses: tobilg/duckdb-extension-self-hosting@<sha> # v1.0.1`.
 - **Limit who can reach the key.** Use an environment with required reviewers, and only run the job on tags.
 - **Why three jobs.** The runner keeps a job's secrets in its own memory for the whole job, and code running in that job can read them there, as the [tj-actions compromise](https://www.cve.org/CVERecord?id=CVE-2025-30066) did. A clean environment for the DuckDB CLI doesn't change that, so a build that's compromised upstream could steal a signing key from any job that loads it, and a key can't be revoked. So `verify` refuses to run in a job that signed or published, and refuses the key, S3 credentials, `AWS_*` credentials and `id-token: write` in its job. It can't see other secrets you add to that job, so don't. With [OIDC](#publishing-to-aws-with-oidc), limiting the role's subject to the publish job's environment is a second layer: a token from another job doesn't match it.
 - **What the action does with the key.** It goes through the signing step's environment into a `0600` file, after the artifacts are downloaded. The file is deleted as soon as the last binary is signed, before compressing, and a final step removes it if the run was killed before that. It's never passed to rclone, and tracing is never turned on.
@@ -665,7 +665,9 @@ Removing a key makes builds signed with it fail on the next `LOAD`, so finish st
 
 ## DuckDB-Wasm
 
-**Experimental.** Wasm builds are signed and published automatically unless you exclude them. They need `brotli` on the runner, which `ubuntu-24.04` has. They get the latest path only, with `Content-Encoding: br` and `Content-Type: application/wasm`.
+**Experimental.** Wasm builds are signed and published automatically unless you exclude them. They need `brotli` on the runner, which `ubuntu-24.04` has. They get the latest path only, with `Content-Encoding: br`, `Content-Type: application/wasm` and `Cache-Control: no-cache, no-transform`.
+
+`no-transform` is for Cloudflare R2. R2 [unpacks an object stored with a `Content-Encoding`](https://rclone.org/s3/#cloudflare-r2) for any request that doesn't accept that encoding, such as rclone's, unless the object's `Cache-Control` has `no-transform`. The bytes it returns then don't match the size and hash that the bucket lists for the object. v1.0.0 uploaded Wasm objects without `no-transform`, so once a Wasm build was live, every later publish failed with `corrupted on transfer: sizes differ`. Since v1.0.1, the action uploads Wasm objects on every publish, even when their bytes haven't changed, so the next publish also fixes the headers of objects that v1.0.0 uploaded. When it compares versions, it reads a live Wasm object in either form.
 
 The tests load the action's output in headless Chrome with DuckDB-Wasm `1.33.1-dev110.0`. That covers `C_STRUCT` and `CPP` builds, and rejection of wrong keys, tampered files, bare `LOAD`, `custom_extension_repository` and direct URLs. Three things are different from native DuckDB:
 
@@ -701,7 +703,7 @@ The Node.js bindings of DuckDB-Wasm can't use custom repositories at the moment:
 
 ```bash
 bash tests/unit.sh        # no network, no Docker
-bash tests/e2e.sh         # SeaweedFS in Docker, real extensions, real DuckDB CLI
+bash tests/e2e.sh         # SeaweedFS in Docker, real extensions, real DuckDB CLI, needs python3
 bash tests/wasm/run.sh    # DuckDB-Wasm in headless Chrome, needs Node.js
 bash tests/rclone-pin.sh  # checks the rclone pin, or moves it: bash tests/rclone-pin.sh v1.76.0
 ```

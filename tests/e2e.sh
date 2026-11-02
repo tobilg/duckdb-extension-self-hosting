@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Takes real extensions through the three jobs of a release: signs them, installs them with the real DuckDB CLI, publishes
-# them to a local S3-compatible store, and installs them from there as a client would. Needs Docker and network access.
+# them to a local S3-compatible store, and installs them from there as a client would. Needs Docker, python3 and network access.
 
 # shellcheck source=tests/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 export RUNS_DIR
 RUNS_DIR=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/duckdb-publisher-e2e.XXXXXX")" && pwd -P)
-trap 'bash "$TESTS_ROOT/tests/stop-s3.sh"; rm -rf "$RUNS_DIR"' EXIT
+trap 'if [ -n "${R2_PROXY_PID:-}" ]; then kill "$R2_PROXY_PID" 2>/dev/null; wait "$R2_PROXY_PID" 2>/dev/null; fi; bash "$TESTS_ROOT/tests/stop-s3.sh"; rm -rf "$RUNS_DIR"' EXIT
 export TEST_HOME="$RUNS_DIR/runner-home"
 mkdir -p "$TEST_HOME" "$RUNS_DIR/keys" "$RUNS_DIR/native" "$RUNS_DIR/stable" "$RUNS_DIR/wasm"
 
@@ -406,13 +406,66 @@ WASM_URL="$WASM_BUCKET/$VERSION/wasm_eh/capi_quack.duckdb_extension.wasm"
 check_equal 'the Wasm object is readable' 200 "$(http_status "$WASM_URL")"
 check_equal 'it is served with Content-Encoding: br' br "$(http_header "$WASM_URL" Content-Encoding)"
 check_equal 'it is served as application/wasm' application/wasm "$(http_header "$WASM_URL" Content-Type)"
-check_equal 'it is revalidated by caches' no-cache "$(http_header "$WASM_URL" Cache-Control)"
+check_equal 'it is revalidated by caches, and stays compressed on R2' 'no-cache, no-transform' "$(http_header "$WASM_URL" Cache-Control)"
 check_contains 'the summary mentions CORS' "$RUN_SUMMARY" 'CORS'
 curl -s --cacert "$CA" -o "$RUNS_DIR/wasm.br" "$WASM_URL"
 brotli -d -c "$RUNS_DIR/wasm.br" >"$RUNS_DIR/wasm.bin"
 check 'the stored bytes are Brotli and verify' verify_extension "$RUNS_DIR/wasm.bin" "$RUNS_DIR/keys/one.pub"
 upload_bundle wasm_rerun wasm-bucket "$WASM_BUNDLE" "$WASM_DIGEST" INPUT_REPOSITORY_URL="$WASM_BUCKET"
 ok_or_log 'a re-run compares with what is live through Brotli' $?
+check_not_contains 'and could compare the versions' "$RUN_LOG" "Can't compare"
+
+echo; echo '--- Wasm on a store that unpacks it, like R2'
+# R2 unpacks an object stored with a Content-Encoding for a request that doesn't accept it, which includes rclone's, unless
+# the object has no-transform. Those that v1.0.0 of this action uploaded don't. tests/r2-proxy.py serves the bucket like that.
+R2_PORT=${R2_PROXY_PORT:-19001}
+python3 -I "$TESTS_ROOT/tests/r2-proxy.py" "$R2_PORT" "$S3_ENDPOINT" "$CA" 2>"$RUNS_DIR/r2-proxy.log" &
+R2_PROXY_PID=$!
+R2="http://127.0.0.1:$R2_PORT"
+for _ in $(seq 1 50); do
+	if curl -s -o /dev/null "$R2/"; then break; fi
+	perl -e 'select(undef, undef, undef, 0.2)'
+done
+wasm_variant() { # <directory> <extension version>
+	mkdir -p "$1"
+	cp "$RUNS_DIR/wasm/capi_quack.duckdb_extension.wasm" "$1/"
+	set_footer_field "$1/capi_quack.duckdb_extension.wasm" 384 "$2"
+}
+# The publish job, with rclone going through the proxy.
+r2_publish() { # <run name> <bundle> <digest> [VAR=value...]
+	local name=$1 bundle=$2 digest=$3
+	shift 3
+	upload_bundle "$name" wasm-bucket "$bundle" "$digest" INPUT_S3_ENDPOINT="$R2" INPUT_S3_PREFIX=r2 INPUT_REPOSITORY_URL="$R2/wasm-bucket/r2" "$@"
+}
+R2_OBJECT="r2/$VERSION/wasm_eh/capi_quack.duckdb_extension.wasm"
+wasm_variant "$RUNS_DIR/wasm-old" 1.0.0
+wasm_variant "$RUNS_DIR/wasm-new" 2.0.0
+sign r2_old_sign "$RUNS_DIR/wasm-old" "$KEY_ONE" INPUT_DUCKDB_VERSION="$VERSION"
+R2_OLD_BUNDLE=$(bundle_dir)
+R2_OLD_DIGEST=$(output_value bundle-digest)
+sign r2_new_sign "$RUNS_DIR/wasm-new" "$KEY_ONE" INPUT_DUCKDB_VERSION="$VERSION"
+R2_NEW_BUNDLE=$(bundle_dir)
+R2_NEW_DIGEST=$(output_value bundle-digest)
+# The newer build, stored the way v1.0.0 uploaded it.
+curl -s --cacert "$CA" -o /dev/null -X PUT --aws-sigv4 "aws:amz:us-east-1:s3" --user "$S3_ACCESS_KEY_ID:$S3_SECRET_ACCESS_KEY" \
+	-H 'Cache-Control: no-cache' -H 'Content-Encoding: br' -H 'Content-Type: application/wasm' \
+	--data-binary "@$R2_NEW_BUNDLE/signed/$VERSION/wasm_eh/capi_quack.duckdb_extension.wasm" "$S3_ENDPOINT/wasm-bucket/$R2_OBJECT"
+curl -s -o "$RUNS_DIR/r2-plain" "$R2/wasm-bucket/$R2_OBJECT"
+check 'the proxy hands that object back unpacked, like R2' is_wasm_binary "$RUNS_DIR/r2-plain"
+if r2_publish r2_older "$R2_OLD_BUNDLE" "$R2_OLD_DIGEST"; then fail 'an older Wasm build is refused'; else pass 'an older Wasm build is refused'; fi
+check_contains 'because it reads the version of the unpacked live object' "$RUN_LOG" 'capi_quack for wasm_eh on DuckDB v2.0.0: 1.0.0 is older than 2.0.0'
+check_contains 'which rclone got unpacked' "$RUNS_DIR/r2-proxy.log" "unpacked /wasm-bucket/$R2_OBJECT"
+check_not_contains 'and could still read' "$RUN_LOG" "Couldn't read"
+r2_publish r2_same "$R2_NEW_BUNDLE" "$R2_NEW_DIGEST"
+ok_or_log 'publishing the same build again works' $?
+check_not_contains 'after comparing the versions' "$RUN_LOG" "Can't compare"
+check_contains 'and the check through the proxy accepts it' "$RUN_LOG" 'serves what was uploaded'
+check_equal 'it rewrote the headers, although the bytes are the same' 'no-cache, no-transform' "$(http_header "$S3_ENDPOINT/wasm-bucket/$R2_OBJECT" Cache-Control)"
+check_equal 'so the store keeps it compressed' br "$(curl -s -o /dev/null -D - "$R2/wasm-bucket/$R2_OBJECT" | tr -d '\r' | awk 'tolower($1) == "content-encoding:" { print $2 }')"
+: >"$RUNS_DIR/r2-proxy.log"
+if r2_publish r2_older_again "$R2_OLD_BUNDLE" "$R2_OLD_DIGEST"; then fail 'the older build is still refused'; else pass 'the older build is still refused'; fi
+check_contains 'after reading the stored bytes' "$RUN_LOG" 'capi_quack for wasm_eh on DuckDB v2.0.0: 1.0.0 is older than 2.0.0'
+check_equal 'which nothing unpacked' '' "$(cat "$RUNS_DIR/r2-proxy.log")"
 
 echo; echo '--- signing alone, and failures'
 run_action signonly INPUT_MODE=sign INPUT_ALL_EXTENSIONS=true INPUT_PATH="$RUNS_DIR/native" INPUT_SIGNING_KEY="$KEY_ONE"

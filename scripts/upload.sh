@@ -20,6 +20,8 @@ tab=$(printf '\t')
 # Latest paths and the key file keep their names between releases, so caches must ask the bucket before reusing them. A
 # versioned object only changes through 'overwrite-versioned', which shouldn't leave stale copies around for long.
 latest_cache='no-cache'
+# Wasm objects are the only ones stored with a Content-Encoding. no-transform keeps R2 and CDNs from unpacking them.
+wasm_cache='no-cache, no-transform'
 versioned_cache='public, max-age=86400'
 upload_jobs=4
 
@@ -70,19 +72,24 @@ check_key_file() {
 check_live_version() { # <index> <object> <kind> <name> <duckdb version> <platform> <new version>
 	local existing="$tmp_dir/existing-$1" object=$2 kind=$3 name=$4 duckdb_version=$5 platform=$6 new_version=$7 size old_version
 	[ -n "$new_version" ] || return 0
-	read_s3_object "$destination/$object" "$existing.packed" || return 0
 	if [ "$kind" = "wasm" ]; then
-		if ! command -v brotli >/dev/null 2>&1; then
+		# R2 may hand back the object unpacked already, see read_s3_wasm_object.
+		read_s3_wasm_object "$destination/$object" "$existing.packed" || return 0
+		if is_wasm_binary "$existing.packed"; then
+			mv "$existing.packed" "$existing"
+		elif ! command -v brotli >/dev/null 2>&1; then
 			warn "Can't compare $object with what's live, because brotli isn't installed."
 			return 0
-		fi
-		if ! brotli -d -c "$existing.packed" >"$existing"; then
-			warn "Can't compare $object with what's live, because it isn't valid Brotli."
+		elif ! brotli -d -c "$existing.packed" >"$existing"; then
+			warn "Can't compare $object with what's live, because it's neither Wasm nor valid Brotli."
 			return 0
 		fi
-	elif ! gunzip -c "$existing.packed" >"$existing" 2>/dev/null; then
-		warn "Can't compare $object with what's live, because it isn't valid gzip."
-		return 0
+	else
+		read_s3_object "$destination/$object" "$existing.packed" || return 0
+		if ! gunzip -c "$existing.packed" >"$existing" 2>/dev/null; then
+			warn "Can't compare $object with what's live, because it isn't valid gzip."
+			return 0
+		fi
 	fi
 	size=$(file_size "$existing")
 	[ "$size" -ge 512 ] || return 0
@@ -139,7 +146,10 @@ check_versioned_objects() {
 upload_latest_object() { # <object> <encoding>
 	local object=$1 encoding=$2
 	if [ "$encoding" = "br" ]; then
-		rclone_s3 copyto "$signed_dir/$object" ":s3:$destination/$object" --checksum --header-upload "Cache-Control: $latest_cache" \
+		# R2 unpacks an object stored with a Content-Encoding for any request that doesn't accept it, unless its Cache-Control has
+		# no-transform. --no-check-dest uploads identical bytes too, because rclone would skip them and keep the headers of the
+		# object in the bucket, and those that v1.0.0 of this action uploaded don't have no-transform.
+		rclone_s3 copyto "$signed_dir/$object" ":s3:$destination/$object" --no-check-dest --header-upload "Cache-Control: $wasm_cache" \
 			--header-upload "Content-Encoding: br" --header-upload "Content-Type: application/wasm" ||
 			die "Uploading $object failed."
 	else

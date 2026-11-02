@@ -33,7 +33,7 @@ jobs:
     steps:
       # Replace <commit-sha> with the commit of a release: this step handles your signing key.
       - id: sign
-        uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+        uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.1
         with:
           mode: sign
           extension-name: my_ext
@@ -53,7 +53,7 @@ jobs:
     timeout-minutes: 30
     permissions: {}
     steps:
-      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.1
         with:
           mode: verify
 
@@ -68,7 +68,7 @@ jobs:
       group: publish-my_ext
       cancel-in-progress: false
     steps:
-      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.0
+      - uses: tobilg/duckdb-extension-self-hosting@<commit-sha> # v1.0.1
         with:
           mode: publish
           bundle-digest: ${{ needs.sign.outputs.bundle-digest }}

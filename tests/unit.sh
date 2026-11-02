@@ -648,8 +648,11 @@ fi
 check_contains 'but warns that nothing was tested' "$RUN_LOG" "didn't test anything"
 
 echo; echo '--- uploading, with a stand-in rclone'
-# Keeps a bucket in a directory, and logs each call. Behaves like the real one where it matters: a missing object isn't an
-# error when reading it, and `copy --immutable` refuses to change an object.
+# Keeps a bucket in a directory, with the headers of each object that copyto uploads in .headers next to it, and logs each
+# call. Behaves like the real one where it matters: a missing object isn't an error when reading it, `copyto --checksum`
+# skips identical bytes and keeps the headers they had, and `copy --immutable` refuses to change an object. FAKE_R2 makes
+# the bucket behave like R2, which unpacks an object stored with a Content-Encoding unless its Cache-Control has
+# no-transform. Real rclone then sees other bytes than the bucket lists, and fails unless told not to check them.
 install_stand_in_rclone() { # <work dir>
 	mkdir -p "$1/bin"
 	cat >"$1/bin/rclone" <<'EOF'
@@ -658,15 +661,37 @@ command=$1 source=$2 destination=$3
 shift 3
 printf '%s %s %s %s\n' "$command" "$source" "$destination" "$*" >>"$FAKE_RCLONE_LOG"
 local_path() { printf '%s/%s' "$FAKE_BUCKET" "${1#:s3:}"; }
+header_path() { printf '%s/.headers/%s' "$FAKE_BUCKET" "${1#:s3:}"; }
 case "$command" in
 copyto)
 	case "$source" in
 	:s3:*)
 		if [ -n "${FAKE_RCLONE_READ_ERROR:-}" ]; then
-			echo 'AccessDenied' >&2
+			printf '2026/01/01 00:00:00 ERROR : Attempt 1/1 failed with 1 errors and: %s\n' "$FAKE_RCLONE_READ_ERROR" >&2
+			printf '2026/01/01 00:00:00 NOTICE: Failed to copyto: %s\n' "$FAKE_RCLONE_READ_ERROR" >&2
 			exit 1
 		fi
-		if [ -f "$(local_path "$source")" ]; then cp "$(local_path "$source")" "$destination"; fi
+		[ -f "$(local_path "$source")" ] || exit 0
+		if [ -n "${FAKE_R2:-}" ] && grep -q '^Content-Encoding:' "$(header_path "$source")" 2>/dev/null &&
+			! grep -q 'no-transform' "$(header_path "$source")"; then
+			case " $* " in
+			*" --ignore-size "*) ;;
+			*)
+				echo 'ERROR : corrupted on transfer: sizes differ' >&2
+				exit 1
+				;;
+			esac
+			case " $* " in
+			*" --ignore-checksum "*) ;;
+			*)
+				echo 'ERROR : corrupted on transfer: md5 hashes differ' >&2
+				exit 1
+				;;
+			esac
+			brotli -d -c "$(local_path "$source")" >"$destination"
+			exit 0
+		fi
+		cp "$(local_path "$source")" "$destination"
 		exit 0
 		;;
 	esac
@@ -676,8 +701,26 @@ copyto)
 		exit 1
 		;;
 	esac
-	mkdir -p "$(dirname "$(local_path "$destination")")"
-	cp "$source" "$(local_path "$destination")"
+	target=$(local_path "$destination")
+	headers=
+	checksum=
+	check_dest=1
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--header-upload)
+			headers="$headers$2
+"
+			shift
+			;;
+		--checksum) checksum=1 ;;
+		--no-check-dest) check_dest= ;;
+		esac
+		shift
+	done
+	if [ -n "$checksum" ] && [ -n "$check_dest" ] && [ -f "$target" ] && cmp -s "$source" "$target"; then exit 0; fi
+	mkdir -p "$(dirname "$target")" "$(dirname "$(header_path "$destination")")"
+	cp "$source" "$target"
+	printf '%s' "$headers" >"$(header_path "$destination")"
 	;;
 copy)
 	file=
@@ -832,8 +875,14 @@ check_refused_upload 'a broken key file in the bucket is refused' "isn't valid"
 if upload INPUT_ALLOW_KEY_CHANGE=true; then pass 'but allow-key-change can replace it'; else fail 'but allow-key-change can replace it' "$(tail -n 2 "$RUN_LOG")"; fi
 new_bucket key_error
 signed_work key_error "$U/v1" "$K/key.pem"
-check_refused_upload 'a key file that can not be read stops the upload' "Couldn't read" FAKE_RCLONE_READ_ERROR=1
+check_refused_upload 'a key file that can not be read stops the upload' "Couldn't read" \
+	FAKE_RCLONE_READ_ERROR='operation error S3: HeadObject, https response error StatusCode: 403, api error Forbidden: Forbidden'
 check_equal 'before anything was uploaded' 0 "$(find "$BUCKET/bucket" -type f | wc -l | tr -d ' ')"
+check 'the error has the reason rclone gave' grep -q "^::error::Couldn't read bucket/.well-known/duckdb-extension-repo.json from the bucket: operation error S3: HeadObject, .*StatusCode: 403" "$RUN_LOG"
+check 'and points to the credentials, because access was denied' grep -q '^::error::.*Check the credentials' "$RUN_LOG"
+check_refused_upload 'another failure to read stops it too' "Couldn't read" FAKE_RCLONE_READ_ERROR='corrupted on transfer: sizes differ 2742824 vs 34548142'
+check 'with the reason rclone gave' grep -q "^::error::Couldn't read .* from the bucket: corrupted on transfer: sizes differ 2742824 vs 34548142\.$" "$RUN_LOG"
+check_not_contains 'and without blaming the credentials' "$RUN_LOG" 'Check the credentials'
 new_bucket key_nofile
 signed_work key_nofile_first "$U/v1" "$K/key.pem" INPUT_PUBLISH_KEY_FILE=false
 upload
@@ -906,6 +955,79 @@ signed_work not_gzip "$U/v1" "$K/key.pem"
 : >"$RUN_LOG"
 if upload; then pass 'a live object that can not be read does not block the release'; else fail 'a live object that can not be read does not block the release' "$(tail -n 2 "$RUN_LOG")"; fi
 check_contains 'but is reported' "$RUN_LOG" "isn't valid gzip"
+
+echo; echo '--- Wasm against the bucket, with a stand-in rclone that unpacks like R2'
+if command -v brotli >/dev/null 2>&1; then
+	# A Wasm build next to a native one, so that the reads of both can be told apart. Starts with the Wasm magic number, like a
+	# real build.
+	wasm_release() { # <directory> <extension version>
+		make_extension "$1/demo.duckdb_extension.wasm" wasm_eh v2.0.0 "$2" CPP 3000
+		printf '\0asm' | dd of="$1/demo.duckdb_extension.wasm" bs=1 seek=0 conv=notrunc 2>/dev/null
+		make_extension "$1/native/demo.duckdb_extension" linux_amd64 v2.0.0 "$2" CPP 3000
+	}
+	wasm_release "$U/wasm1" v1.0.0
+	wasm_release "$U/wasm2" v2.0.0
+	WASM_OBJECT=v2.0.0/wasm_eh/demo.duckdb_extension.wasm
+	wasm_headers() { cat "$BUCKET/.headers/bucket/$WASM_OBJECT"; }
+	wasm_reads() { grep "^copyto :s3:bucket/$WASM_OBJECT " "$RCLONE_LOG"; }
+	native_reads() { grep '^copyto :s3:bucket/.*\.gz ' "$RCLONE_LOG"; }
+	wasm_uploads() { grep -c "^copyto .* :s3:bucket/$WASM_OBJECT " "$RCLONE_LOG" | tr -d ' '; }
+
+	new_bucket wasm
+	signed_work wasm_first "$U/wasm2" "$K/key.pem"
+	if upload FAKE_R2=1; then pass 'publishes a Wasm build'; else fail 'publishes a Wasm build' "$(tail -n 2 "$RUN_LOG")"; fi
+	check_contains 'with no-transform, so that R2 keeps it compressed' "$RCLONE_LOG" "$WASM_OBJECT --no-check-dest --header-upload Cache-Control: no-cache, no-transform --header-upload Content-Encoding: br"
+	check_equal 'and the bucket has those headers' 'Cache-Control: no-cache, no-transform|Content-Encoding: br|Content-Type: application/wasm' "$(wasm_headers | paste -sd '|' -)"
+	check_contains 'native objects keep no-cache alone, because they have no Content-Encoding' "$RCLONE_LOG" 'v2.0.0/linux_amd64/demo.duckdb_extension.gz --checksum --header-upload Cache-Control: no-cache --s3-provider'
+	signed_work wasm_again "$U/wasm2" "$K/key.pem"
+	: >"$RCLONE_LOG"
+	: >"$RUN_LOG"
+	if upload FAKE_R2=1; then pass 'publishing it again into a bucket that has it works'; else fail 'publishing it again into a bucket that has it works' "$(tail -n 2 "$RUN_LOG")"; fi
+	check 'after reading the live Wasm object' test -n "$(wasm_reads)"
+	check_not_contains 'and comparing its version' "$RUN_LOG" "Can't compare"
+	check_equal 'and uploads it again although nothing changed, which rewrites its headers' 1 "$(wasm_uploads)"
+	signed_work wasm_old "$U/wasm1" "$K/key.pem"
+	check_refused_upload 'an older Wasm build is refused, comparing with the live object as it is stored' 'demo for wasm_eh on DuckDB v2.0.0: v1.0.0 is older than v2.0.0' FAKE_R2=1
+
+	# What v1.0.0 of this action left in a bucket: the same build, without no-transform, so R2 hands it back unpacked.
+	new_bucket wasm_r2
+	signed_work wasm_r2_live "$U/wasm2" "$K/key.pem"
+	upload
+	printf 'Cache-Control: no-cache\nContent-Encoding: br\nContent-Type: application/wasm\n' >"$BUCKET/.headers/bucket/$WASM_OBJECT"
+	LIVE=$(sha256_file "$BUCKET/bucket/$WASM_OBJECT")
+	: >"$RCLONE_LOG"
+	signed_work wasm_r2_old "$U/wasm1" "$K/key.pem"
+	check_refused_upload 'an older Wasm build is refused, against a live object that R2 hands back unpacked' 'demo for wasm_eh on DuckDB v2.0.0: v1.0.0 is older than v2.0.0' FAKE_R2=1
+	check_not_contains 'which it could read' "$RUN_LOG" "Couldn't read"
+	check 'because Wasm objects are read without the size and checksum checks' grep -q -- '--ignore-size --ignore-checksum' <<<"$(wasm_reads)"
+	check 'while native objects keep them' test -n "$(native_reads)"
+	check_not 'all of them' grep -q -- '--ignore' <<<"$(native_reads)"
+	check_equal 'and latest is unchanged' "$LIVE" "$(sha256_file "$BUCKET/bucket/$WASM_OBJECT")"
+	signed_work wasm_r2_same "$U/wasm2" "$K/key.pem"
+	: >"$RCLONE_LOG"
+	: >"$RUN_LOG"
+	if upload FAKE_R2=1; then pass 'the same build goes through against an unpacked live object'; else fail 'the same build goes through against an unpacked live object' "$(tail -n 2 "$RUN_LOG")"; fi
+	check_not_contains 'after comparing the version' "$RUN_LOG" "Can't compare"
+	check_equal 'the bytes in the bucket stay the same' "$LIVE" "$(sha256_file "$BUCKET/bucket/$WASM_OBJECT")"
+	check 'but its headers now have no-transform' grep -q '^Cache-Control: no-cache, no-transform$' "$BUCKET/.headers/bucket/$WASM_OBJECT"
+	printf 'Cache-Control: no-cache\nContent-Encoding: br\nContent-Type: application/wasm\n' >"$BUCKET/.headers/bucket/$WASM_OBJECT"
+	: >"$RUN_LOG"
+	if check_repository FAKE_R2=1; then pass 'the check over s3:// accepts a Wasm object that R2 hands back unpacked'; else fail 'the check over s3:// accepts a Wasm object that R2 hands back unpacked' "$(tail -n 2 "$RUN_LOG")"; fi
+	check_contains 'after checking it' "$RUN_LOG" "  $WASM_OBJECT"
+	printf 'not wasm' >"$RUNS_DIR/not-wasm"
+	brotli -c "$RUNS_DIR/not-wasm" >"$BUCKET/bucket/$WASM_OBJECT"
+	: >"$RUN_LOG"
+	check_refused 'and still fails another build' 'different build' check_repository FAKE_R2=1
+	new_bucket wasm_broken
+	mkdir -p "$BUCKET/bucket/$(dirname "$WASM_OBJECT")"
+	printf 'neither' >"$BUCKET/bucket/$WASM_OBJECT"
+	signed_work wasm_broken "$U/wasm1" "$K/key.pem"
+	: >"$RUN_LOG"
+	if upload FAKE_R2=1; then pass 'a live Wasm object that is neither Wasm nor Brotli does not block the release'; else fail 'a live Wasm object that is neither Wasm nor Brotli does not block the release' "$(tail -n 2 "$RUN_LOG")"; fi
+	check_contains 'but is reported' "$RUN_LOG" "neither Wasm nor valid Brotli"
+else
+	printf 'skip Wasm against the bucket: brotli is not installed\n'
+fi
 
 echo; echo '--- a failed upload'
 new_bucket partial
